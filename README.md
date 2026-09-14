@@ -22,7 +22,7 @@ Instead of wrapping bloated subprocess gateways like `supergateway` (which suffe
 - 🚀 **Native Remote Architecture**: Zero subprocess wrappers, zero pipe stalls.
 - 🪶 **Extremely Lightweight**: Built on Python 3.12 + official `mcp` SDK; resident memory is only **~15 MB** (vs 100MB+ for Node.js suites).
 - 💬 **Tailored for AI Agents**: Flat, intuitive tooling for messaging, history retrieval, group management, and quotation replies.
-- ✨ **Unique QQ Reaction Support**: First-class support for `set_msg_emoji_like` (text alias matching + full access to 390+ QQ system reactions).
+- ✨ **Full 280+ QQ System Reaction Support**: Built-in 345+ popular Chinese aliases & network memes directly mapped to Linux NTQQ official Reaction IDs, plus full integer ID passthrough.
 - 🛡️ **Hardened Production Security**: Bearer Token authentication, DNS-rebinding protection bypass for reverse proxies, and single-port HTTPS multiplexing.
 - ⚡ **Universal OneBot Pass-through**: Includes `call_onebot_action` to access all 170+ native OneBot v11 actions without writing extra code.
 
@@ -45,7 +45,8 @@ Instead of wrapping bloated subprocess gateways like `supergateway` (which suffe
 ┌──────────────────────────────────────────────┐
 │  SnowLuma Remote MCP Server (FastMCP ASGI)   │
 │  - BearerAuthMiddleware                      │
-│  - 17 Standard Agent Tools + Emoji Mapper    │
+│  - 17 Standard Agent Tools                   │
+│  - 280+ Official Reactions & 345+ Meme Map   │
 └──────────────────┬───────────────────────────┘
                    │  HTTP POST (127.0.0.1:3000)
                    ▼
@@ -67,8 +68,8 @@ Instead of wrapping bloated subprocess gateways like `supergateway` (which suffe
 | `delete_msg` | Recall message | Recalls a message within timeout |
 | `get_msg` | Get message detail | Retrieves sender and raw content by message ID |
 | `get_group_msg_history` | Read recent group history | Strips redundant fields to save LLM tokens |
-| `set_msg_emoji_like` | Set message Reaction | Supports Chinese names (e.g. `点赞`, `狗头`, `贴贴`) & numeric IDs |
-| `list_supported_emojis` | List reaction emojis | Quick dictionary lookup for available reactions |
+| `set_msg_emoji_like` | Set message Reaction | Supports 345+ Chinese names (e.g. `点赞`, `狗头`, `菜狗`, `尊嘟假嘟`) & 280+ numeric IDs |
+| `list_supported_emojis` | List reaction emojis | Returns categorized lists and full dictionary with 345+ mappings |
 
 ### 2. Group & Profile Management
 | Tool | Description |
@@ -186,19 +187,23 @@ In [RikkaHub](https://github.com/rikkahub/rikkahub):
 
 ---
 
-## 🎭 Reaction Emojis Cheat Sheet
+## 🎭 Reaction Emojis Cheat Sheet (280+ Supported)
 
-When using `set_msg_emoji_like`, you can pass either the **Chinese Name** or the **QQ Face ID**:
+When calling `set_msg_emoji_like`, you can pass either the **Chinese Name**, **Meme Alias**, or the **Numeric ID**:
 
-| Name | ID | Name | ID | Name | ID |
-|---|---|---|---|---|---|
-| `点赞` / `赞` | 76 | `爱心` / `心` | 66 | `OK` / `好的` | 124 |
-| `狗头` | 277 | `摸鱼` | 285 | `贴贴` / `蹭蹭` | 350 |
-| `菜狗` | 317 | `便便` | 59 | `大哭` | 9 |
-| `流泪` | 5 | `心碎` | 67 | `玫瑰` | 63 |
-| `炸弹` | 11 | `骷髅` | 37 | `微笑` | 14 |
-| `喵喵` | 175 | `斜眼笑` / `滑稽` | 178 | `幽灵` | 187 |
-| `打call` | 311 | `大怨种` | 344 | `庆祝` | 147 |
+### Categorized Popular Picks
+- **认同赞美 (Approval & Praise)**:
+  - `点赞` / `赞` (`76`), `超级赞` (`364`), `666` (`356`), `强` (`76`), `OK` / `好的` (`124`), `收到` (`428`), `鼓掌` (`99`), `崇拜` (`318`)
+- **喜爱亲昵 (Affection & Warmth)**:
+  - `贴贴` / `蹭蹭` (`350`), `比心` (`319`), `爱心` / `红心` (`66`), `抱抱` (`49`), `亲亲` (`109`), `蹭一蹭` (`242`), `么么哒` (`410`)
+- **幽默搞怪 (Fun & Memes)**:
+  - `狗头` / `汪汪` (`277`), `菜狗` / `菜汪` (`317`), `打call` (`311`), `摸鱼` (`285`), `尊嘟假嘟` (`354`), `喵喵` (`307`), `摇起来` (`413`)
+- **震惊吐槽 (Shock & Banter)**:
+  - `吃瓜` (`271`), `问号脸` / `疑惑` (`268`), `托腮` (`212`), `辣眼睛` (`265`), `不是吧` (`476`), `给你一拳` (`474`), `裂开` (`357`), `大怨种` (`344`)
+- **情绪状态 (Mood & Empathy)**:
+  - `笑哭` (`182`), `坏笑` (`101`), `微笑` (`14`), `大哭` (`9`), `流泪` (`5`), `委屈` (`106`), `捂脸` (`264`), `emo` (`382`), `头秃` (`267`)
+
+*(Call `list_supported_emojis` tool at any time to get the complete dictionary of all 345+ aliases and 280+ system IDs).*
 
 ---
 
