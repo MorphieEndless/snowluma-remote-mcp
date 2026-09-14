@@ -1,0 +1,18 @@
+[Unit]
+Description=SnowLuma Remote MCP Server (Streamable HTTP / SSE)
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/snowluma-mcp
+EnvironmentFile=/opt/snowluma-mcp/config.env
+ExecStart=/opt/snowluma-mcp/venv/bin/python /opt/snowluma-mcp/server.py
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=10
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
