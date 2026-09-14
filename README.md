@@ -1,13 +1,15 @@
-# SnowLuma Remote MCP Server
+<p align="right">
+  <strong>Language:</strong>
+  <b>English</b> |
+  <a href="README_zh.md">简体中文</a>
+</p>
 
 <div align="center">
 
-[![English](https://img.shields.io/badge/Language-English-blue.svg)](README.md)
-[![简体中文](https://img.shields.io/badge/语言-简体中文-red.svg)](README_zh.md)
+# SnowLuma Remote MCP Server
 
-**English** • [简体中文](README_zh.md)
-
-</div>
+[![English](https://img.shields.io/badge/Language-English-blue?style=for-the-badge)](README.md)
+[![简体中文](https://img.shields.io/badge/语言-简体中文-red?style=for-the-badge)](README_zh.md)
 
 <br/>
 
@@ -16,8 +18,12 @@
 [![MCP Protocol](https://img.shields.io/badge/MCP-2024--11--05-purple.svg)](https://modelcontextprotocol.io)
 [![SnowLuma](https://img.shields.io/badge/SnowLuma-OneBot%20v11-orange.svg)](https://github.com/SnowLuma/SnowLuma)
 
-> **Next-Gen Remote MCP (Streamable HTTP / SSE) Gateway for SnowLuma OneBot v11.**  
-> Native Claude MCP Server crafted for Android [RikkaHub](https://github.com/rikkahub/rikkahub) & Remote AI Agents.
+<p align="center">
+  <strong>Next-Gen Remote MCP (Streamable HTTP / SSE) Gateway for SnowLuma OneBot v11.</strong><br/>
+  Native Claude MCP Server crafted for Android <a href="https://github.com/rikkahub/rikkahub">RikkaHub</a> & Remote AI Agents.
+</p>
+
+</div>
 
 ---
 
@@ -30,7 +36,7 @@ However, when running AI agents on mobile devices (e.g. **RikkaHub on Android**)
 Instead of wrapping bloated subprocess gateways like `supergateway` (which suffer from process stalls, high memory consumption, and zombie pipes during mobile network switches), **SnowLuma Remote MCP** provides an ultra-lightweight, native **Python + FastMCP** server.
 
 ### Key Highlights
-- 🚀 **Native Remote Architecture**: Zero subprocess wrappers, zero pipe stalls.
+- 🚀 **Native Remote Architecture**: Pure asynchronous ASGI service, zero subprocess wrappers, zero pipe stalls.
 - 🪶 **Extremely Lightweight**: Built on Python 3.12 + official `mcp` SDK; resident memory is only **~15 MB** (vs 100MB+ for Node.js suites).
 - 💬 **Tailored for AI Agents**: Flat, intuitive tooling for messaging, history retrieval, group management, and quotation replies.
 - ✨ **Full 280+ QQ System Reaction Support**: Built-in 345+ popular Chinese aliases & network memes directly mapped to Linux NTQQ official Reaction IDs, plus full integer ID passthrough.
@@ -41,29 +47,11 @@ Instead of wrapping bloated subprocess gateways like `supergateway` (which suffe
 
 ## 🏗️ Architecture
 
-```
-┌──────────────────────────────────────┐
-│  Mobile Client (RikkaHub on Android) │
-└──────────────────┬───────────────────┘
-                   │  HTTPS POST + Bearer Token
-                   │  (Streamable HTTP: /mcp)
-                   ▼
-       ┌────────────────────────┐
-       │   Nginx (Reverse Proxy)│
-       └───────────┬────────────┘
-                   │  HTTP (127.0.0.1:8766)
-                   ▼
-┌──────────────────────────────────────────────┐
-│  SnowLuma Remote MCP Server (FastMCP ASGI)   │
-│  - BearerAuthMiddleware                      │
-│  - 17 Standard Agent Tools                   │
-│  - 280+ Official Reactions & 345+ Meme Map   │
-└──────────────────┬───────────────────────────┘
-                   │  HTTP POST (127.0.0.1:3000)
-                   ▼
-┌──────────────────────────────────────────────┐
-│  SnowLuma Runtime (NTQQ + OneBot v11 HTTP)   │
-└──────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Client["📱 Mobile Client (Android RikkaHub)"] -->|"HTTPS POST + Bearer Token<br/>(Streamable HTTP: /mcp)"| Nginx["🌐 Nginx (Reverse Proxy)"]
+    Nginx -->|"HTTP (127.0.0.1:8766)"| MCP["⚡ SnowLuma Remote MCP Server (FastMCP ASGI)<br/>• BearerAuthMiddleware<br/>• 17 Standard Agent Tools<br/>• 280+ Official Reactions & 345+ Meme Map"]
+    MCP -->|"HTTP POST (127.0.0.1:3000)"| SnowLuma["🐧 SnowLuma Runtime (Linux NTQQ + OneBot v11)"]
 ```
 
 ---
@@ -83,22 +71,22 @@ Instead of wrapping bloated subprocess gateways like `supergateway` (which suffe
 | `list_supported_emojis` | List reaction emojis | Returns categorized lists and full dictionary with 345+ mappings |
 
 ### 2. Group & Profile Management
-| Tool | Description |
-|---|---|
-| `get_login_info` | Get bot QQ number and nickname |
-| `get_status` | Get SnowLuma service and online status |
-| `get_friend_list` | List all friends |
-| `get_group_list` | List all joined groups |
-| `get_group_info` | Get group name, member count, and metadata |
-| `get_group_member_list`| Get complete member list of a group |
-| `set_group_ban` | Mute/unmute group member |
-| `set_group_card` | Change member group card/nickname |
-| `set_group_kick` | Kick member from group |
+| Tool | Description | Highlights |
+|---|---|---|
+| `get_login_info` | Get bot QQ number and nickname | Retrieves logged-in account info |
+| `get_status` | Get SnowLuma service status | Returns connection health and online status |
+| `get_friend_list` | List all friends | Retrieves friend account list |
+| `get_group_list` | List all joined groups | Returns group IDs, names, and capacity |
+| `get_group_info` | Get group details | Supports `group_id` and optional `no_cache` |
+| `get_group_member_list` | Get complete group member list | Returns full member details |
+| `set_group_ban` | Mute/unmute group member | Duration in seconds (0 = unmute) |
+| `set_group_card` | Change member group nickname | Sets custom group card |
+| `set_group_kick` | Kick member from group | Optional `reject_add_request` |
 
 ### 3. Escape Hatch
-| Tool | Description |
-|---|---|
-| `call_onebot_action` | Direct pass-through to call any of SnowLuma's 170+ OneBot v11 actions |
+| Tool | Description | Highlights |
+|---|---|---|
+| `call_onebot_action` | Universal OneBot pass-through | Direct access to all 170+ OneBot v11 actions |
 
 ---
 
@@ -203,15 +191,21 @@ In [RikkaHub](https://github.com/rikkahub/rikkahub):
 When calling `set_msg_emoji_like`, you can pass either the **Chinese Name**, **Meme Alias**, or the **Numeric ID**:
 
 ### Categorized Popular Picks
-- **认同赞美 (Approval & Praise)**:
+- **Approval & Praise (认同赞美)**:
   - `点赞` / `赞` (`76`), `超级赞` (`364`), `666` (`356`), `强` (`76`), `OK` / `好的` (`124`), `收到` (`428`), `鼓掌` (`99`), `崇拜` (`318`)
-- **喜爱亲昵 (Affection & Warmth)**:
+- **Affection & Warmth (喜爱亲昵)**:
   - `贴贴` / `蹭蹭` (`350`), `比心` (`319`), `爱心` / `红心` (`66`), `抱抱` (`49`), `亲亲` (`109`), `蹭一蹭` (`242`), `么么哒` (`410`)
-- **幽默搞怪 (Fun & Memes)**:
+- **Fun & Memes (幽默搞怪)**:
   - `狗头` / `汪汪` (`277`), `菜狗` / `菜汪` (`317`), `打call` (`311`), `摸鱼` (`285`), `尊嘟假嘟` (`354`), `喵喵` (`307`), `摇起来` (`413`)
-- **震惊吐槽 (Shock & Banter)**:
+- **Shock & Banter (震惊吐槽)**:
   - `吃瓜` (`271`), `问号脸` / `疑惑` (`268`), `托腮` (`212`), `辣眼睛` (`265`), `不是吧` (`476`), `给你一拳` (`474`), `裂开` (`357`), `大怨种` (`344`)
-- **情绪状态 (Mood & Empathy)**:
+- **Mood & Empathy (情绪状态)**:
   - `笑哭` (`182`), `坏笑` (`101`), `微笑` (`14`), `大哭` (`9`), `流泪` (`5`), `委屈` (`106`), `捂脸` (`264`), `emo` (`382`), `头秃` (`267`)
 
-*(Call `list_supported_emojis` tool at any time to get the complete dictionary of all 345+ aliases and 280+ system IDs).*\n\n---\n\n## 📄 License\n\nDistributed under the [MIT License](LICENSE).\n
+*(Call `list_supported_emojis` tool at any time to get the complete dictionary of all 345+ aliases and 280+ system IDs).*
+
+---
+
+## 📄 License
+
+Distributed under the [MIT License](LICENSE).
