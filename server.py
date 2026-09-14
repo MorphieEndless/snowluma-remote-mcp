@@ -224,6 +224,11 @@ EMOJI_NAME_MAP: dict[str, int] = {
     "踩": 77,
     "NO": 123,
     "点赞": 76,
+    "㊗": 12951,
+    "祝": 12951,
+    "笑翻": 129315,
+    "🤣": 129315,
+    "笑倒": 129315,
     "我酸了": 273,
     "猪头": 46,
     "菜刀": 112,
@@ -396,6 +401,9 @@ def resolve_emoji_id(emoji: str | int) -> int:
     lower_s = stripped.lower()
     if lower_s in EMOJI_NAME_MAP:
         return EMOJI_NAME_MAP[lower_s]
+    # 单个 Unicode 字符（如单个 Emoji 🤣 或 ㊗）自动转为十进制码点
+    if len(stripped) == 1:
+        return ord(stripped)
     for k, v in EMOJI_NAME_MAP.items():
         if k in stripped or stripped in k:
             return v
