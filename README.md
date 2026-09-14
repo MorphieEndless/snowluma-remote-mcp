@@ -1,5 +1,16 @@
 # SnowLuma Remote MCP Server
 
+<div align="center">
+
+[![English](https://img.shields.io/badge/Language-English-blue.svg)](README.md)
+[![简体中文](https://img.shields.io/badge/语言-简体中文-red.svg)](README_zh.md)
+
+**English** • [简体中文](README_zh.md)
+
+</div>
+
+<br/>
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python Version](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
 [![MCP Protocol](https://img.shields.io/badge/MCP-2024--11--05-purple.svg)](https://modelcontextprotocol.io)
@@ -203,10 +214,4 @@ When calling `set_msg_emoji_like`, you can pass either the **Chinese Name**, **M
 - **情绪状态 (Mood & Empathy)**:
   - `笑哭` (`182`), `坏笑` (`101`), `微笑` (`14`), `大哭` (`9`), `流泪` (`5`), `委屈` (`106`), `捂脸` (`264`), `emo` (`382`), `头秃` (`267`)
 
-*(Call `list_supported_emojis` tool at any time to get the complete dictionary of all 345+ aliases and 280+ system IDs).*
-
----
-
-## 📄 License
-
-Distributed under the [MIT License](LICENSE).
+*(Call `list_supported_emojis` tool at any time to get the complete dictionary of all 345+ aliases and 280+ system IDs).*\n\n---\n\n## 📄 License\n\nDistributed under the [MIT License](LICENSE).\n
