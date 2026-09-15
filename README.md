@@ -38,7 +38,7 @@ Instead of wrapping bloated subprocess gateways like `supergateway` (which suffe
 ### Key Highlights
 - 🚀 **Native Remote Architecture**: Pure asynchronous ASGI service, zero subprocess wrappers, zero pipe stalls.
 - 🪶 **Extremely Lightweight**: Built on Python 3.12 + official `mcp` SDK; resident memory is only **~15 MB** (vs 100MB+ for Node.js suites).
-- 💬 **Tailored for AI Agents**: Flat, intuitive tooling for messaging, history retrieval, group management, and quotation replies.
+- 💬 **Tailored for AI Agents**: Flat, intuitive tooling for messaging, chat history retrieval, smart forward message unpacking, group management, and quotation replies (19 tools).
 - ✨ **Full 280+ QQ System Reaction Support**: Built-in 345+ popular Chinese aliases & network memes directly mapped to Linux NTQQ official Reaction IDs, plus full integer ID passthrough.
 - 🛡️ **Hardened Production Security**: Bearer Token authentication, DNS-rebinding protection bypass for reverse proxies, and single-port HTTPS multiplexing.
 - ⚡ **Universal OneBot Pass-through**: Includes `call_onebot_action` to access all 170+ native OneBot v11 actions without writing extra code.
@@ -50,13 +50,13 @@ Instead of wrapping bloated subprocess gateways like `supergateway` (which suffe
 ```mermaid
 flowchart TD
     Client["📱 Mobile Client (Android RikkaHub)"] -->|"HTTPS POST + Bearer Token<br/>(Streamable HTTP: /mcp)"| Nginx["🌐 Nginx (Reverse Proxy)"]
-    Nginx -->|"HTTP (127.0.0.1:8766)"| MCP["⚡ SnowLuma Remote MCP Server (FastMCP ASGI)<br/>• BearerAuthMiddleware<br/>• 17 Standard Agent Tools<br/>• 280+ Official Reactions & 345+ Meme Map"]
+    Nginx -->|"HTTP (127.0.0.1:8766)"| MCP["⚡ SnowLuma Remote MCP Server (FastMCP ASGI)<br/>• BearerAuthMiddleware<br/>• 19 Standard Agent Tools<br/>• 280+ Official Reactions & 345+ Meme Map"]
     MCP -->|"HTTP POST (127.0.0.1:3000)"| SnowLuma["🐧 SnowLuma Runtime (Linux NTQQ + OneBot v11)"]
 ```
 
 ---
 
-## 🛠️ Tool Catalog (17 Tools)
+## 🛠️ Tool Catalog (19 Tools)
 
 ### 1. Messaging & Interaction
 | Tool | Description | Highlights |
@@ -66,7 +66,9 @@ flowchart TD
 | `send_msg` | Universal message sender | Unified interface for both group and private |
 | `delete_msg` | Recall message | Recalls a message within timeout |
 | `get_msg` | Get message detail | Retrieves sender and raw content by message ID |
-| `get_group_msg_history` | Read recent group history | Strips redundant fields to save LLM tokens |
+| `get_group_msg_history` | Read recent group history | Strips redundant fields and extracts forward message IDs |
+| `get_friend_msg_history` | Read private chat history | Cleaned sender info and extracts forward message IDs |
+| `get_forward_msg` | Unpack forward message chain | Transforms bloated OneBot AST into high-signal Markdown dialogue (95% token savings) |
 | `set_msg_emoji_like` | Set message Reaction | Supports 345+ Chinese names (e.g. `点赞`, `狗头`, `菜狗`, `尊嘟假嘟`) & 280+ numeric IDs |
 | `list_supported_emojis` | List reaction emojis | Returns categorized lists and full dictionary with 345+ mappings |
 
@@ -109,7 +111,7 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 ```
-Edit `.env`:
+Edit `.env`:\
 ```env
 MCP_HOST=127.0.0.1
 MCP_PORT=8766
@@ -124,7 +126,7 @@ SNOWLUMA_TIMEOUT=30.0
 ```bash
 python server.py
 ```
-Health check:
+Health check:\
 ```bash
 curl http://127.0.0.1:8766/health
 ```
@@ -141,7 +143,7 @@ sudo systemctl enable --now snowluma-mcp.service
 ```
 
 ### Nginx Reverse Proxy
-Add the following locations into your HTTPS `server` block:
+Add the following locations into your HTTPS `server` block:\
 ```nginx
 # Remote MCP Endpoint
 location /mcp {
