@@ -2,12 +2,19 @@
 Description=SnowLuma Remote MCP Server (Streamable HTTP / SSE)
 After=network.target docker.service
 
+# ────────────────────────────────────────────────────────────────
+# 部署前请把 <INSTALL_DIR> 换成你自己的安装目录，例如 /opt/your-service
+# 本文件刻意使用占位符，不写死任何具体路径。
+# 更安全的做法是让服务以专用非 root 用户运行（User=<your-service-user>），
+# 并把该用户设为 <INSTALL_DIR> 的所有者。
+# ────────────────────────────────────────────────────────────────
+
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/your-service
-EnvironmentFile=/opt/your-service/config.env
-ExecStart=/opt/your-service/venv/bin/python /opt/your-service/server.py
+WorkingDirectory=<INSTALL_DIR>
+EnvironmentFile=<INSTALL_DIR>/config.env
+ExecStart=<INSTALL_DIR>/venv/bin/python <INSTALL_DIR>/server.py
 Restart=always
 RestartSec=3
 KillSignal=SIGTERM
