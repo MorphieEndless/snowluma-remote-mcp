@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 import os
 import re
 import html
@@ -19,6 +20,7 @@ from typing import Any, AsyncIterator
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import TextContent
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, Response
@@ -688,6 +690,27 @@ def collect_message_ids(clean_msgs: list[dict[str, Any]]) -> list[int | None]:
     return [m.get("message_id") for m in clean_msgs]
 
 
+def build_text_payload(rendered_doc: str, clean_msgs: list[dict[str, Any]]) -> list[TextContent]:
+    """text 模式的返回体：两个纯文本块，而不是一个 JSON 对象。
+
+    为什么不能是 JSON：JSON 里的换行会被转义成字面的 \n。客户端把工具结果当字符串渲染时
+    （RikkaHub 的 ToolUI.kt 就是这么做的），整段剧本会挤成一行，人没法核对解析结果。
+    返回纯文本块时换行是真换行，客户端会原样排版。
+
+    第一块 = 带序号的可读剧本；第二块 = 只装 count 与 message_ids 的紧凑 JSON
+    （不缩进、不换行，省 token；需要好看的客户端会自己格式化）。
+    """
+    meta = json.dumps(
+        {"count": len(clean_msgs), "message_ids": collect_message_ids(clean_msgs)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return [
+        TextContent(type="text", text=rendered_doc),
+        TextContent(type="text", text=meta),
+    ]
+
+
 def format_chat_message_item(index: int, sender_name: str, time_str: str, text: str) -> str:
     """将单条聊天记录格式化为有序列表项，行首编号即这条消息在本次结果中的序号。
 
@@ -849,7 +872,7 @@ def build_snowluma_mcp() -> FastMCP:
         count: int = 20,
         message_seq: int | None = None,
         format: str = "text",
-    ) -> dict[str, Any]:
+    ) -> Any:
         """获取指定群的最近历史消息记录。count 默认为 20 条，便于理解上下文。
         
         参数:
@@ -857,7 +880,7 @@ def build_snowluma_mcp() -> FastMCP:
         - count: 获取条数（1~100，默认 20）
         - message_seq: 起始消息序号（用于向前翻页查询历史）
         - format: 输出格式，可选:
-            - 'text' (默认): 生成带序号的人类可读 Markdown 剧本（多行消息自动悬挂缩进），并附带 message_ids；剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
+            - 'text' (默认): 返回两段纯文本块（不是 JSON，所以换行不会被转义成 \n）：第一段是带序号的可读剧本（多行消息自动悬挂缩进），第二段是 {count, message_ids}，剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
             - 'compact': 结构化精简 JSON 数组，已剥离冗余协议字段、CDN 长链接与同值别名字段（不再输出 sender / content）
             - 'raw': 原始 OneBot 数据（仅供底层调试）
         """
@@ -886,13 +909,7 @@ def build_snowluma_mcp() -> FastMCP:
             f"### 群聊历史记录 (群号: {group_id}，共 {len(clean_msgs)} 条消息)",
             clean_msgs,
         )
-        return {
-            "ok": True,
-            "group_id": int(group_id),
-            "count": len(clean_msgs),
-            "rendered_text": rendered_doc,
-            "message_ids": collect_message_ids(clean_msgs),
-        }
+        return build_text_payload(rendered_doc, clean_msgs)
 
     @mcp.tool()
     async def get_friend_msg_history(
@@ -900,7 +917,7 @@ def build_snowluma_mcp() -> FastMCP:
         count: int = 20,
         message_seq: int | None = None,
         format: str = "text",
-    ) -> dict[str, Any]:
+    ) -> Any:
         """获取指定好友/私聊对象的最近历史消息记录。
         
         参数:
@@ -908,7 +925,7 @@ def build_snowluma_mcp() -> FastMCP:
         - count: 获取条数（1~100，默认 20）
         - message_seq: 起始消息序号（用于向前翻页查询历史）
         - format: 输出格式，可选:
-            - 'text' (默认): 生成带序号的人类可读 Markdown 剧本（多行消息自动悬挂缩进），并附带 message_ids；剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
+            - 'text' (默认): 返回两段纯文本块（不是 JSON，所以换行不会被转义成 \n）：第一段是带序号的可读剧本（多行消息自动悬挂缩进），第二段是 {count, message_ids}，剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
             - 'compact': 结构化精简 JSON 数组，已剥离冗余协议字段、CDN 长链接与同值别名字段（不再输出 sender / content）
             - 'raw': 原始 OneBot 数据（仅供底层调试）
         """
@@ -937,25 +954,19 @@ def build_snowluma_mcp() -> FastMCP:
             f"### 私聊历史记录 (QQ: {user_id}，共 {len(clean_msgs)} 条消息)",
             clean_msgs,
         )
-        return {
-            "ok": True,
-            "user_id": int(user_id),
-            "count": len(clean_msgs),
-            "rendered_text": rendered_doc,
-            "message_ids": collect_message_ids(clean_msgs),
-        }
+        return build_text_payload(rendered_doc, clean_msgs)
 
     @mcp.tool()
     async def get_forward_msg(
         forward_id: str,
         format: str = "text",
-    ) -> dict[str, Any]:
+    ) -> Any:
         """获取并解析合并转发聊天记录（将臃肿的底层 OneBot 数据结构清洗转换为高信噪比对话内容）。
         
         参数:
         - forward_id: 合并转发 ID（来自 CQ 码 [CQ:forward,id=...] 或 get_friend_msg_history 中的 forward_id 字段）
         - format: 输出格式，可选:
-            - 'text' (默认): 生成带序号的人类可读 Markdown 剧本（多行消息自动悬挂缩进），并附带 message_ids；剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
+            - 'text' (默认): 返回两段纯文本块（不是 JSON，所以换行不会被转义成 \n）：第一段是带序号的可读剧本（多行消息自动悬挂缩进），第二段是 {count, message_ids}，剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
             - 'compact': 结构化精简 JSON 数组，已剥离冗余字段、CDN 长链接与同值别名字段（不再输出 sender / content）
             - 'raw': 原始 OneBot 数据（仅供底层调试）
         """
@@ -985,13 +996,7 @@ def build_snowluma_mcp() -> FastMCP:
             f"### 合并转发记录（共 {len(clean_msgs)} 条消息）",
             clean_msgs,
         )
-        return {
-            "ok": True,
-            "forward_id": clean_id,
-            "count": len(clean_msgs),
-            "rendered_text": rendered_doc,
-            "message_ids": collect_message_ids(clean_msgs),
-        }
+        return build_text_payload(rendered_doc, clean_msgs)
 
     @mcp.tool()
     async def set_msg_emoji_like(
@@ -1136,7 +1141,7 @@ def create_asgi_app() -> Starlette:
         login_res = await call_snowluma("get_login_info")
         return JSONResponse({
             "service": "snowluma-mcp",
-            "version": "1.2.3",
+            "version": "1.2.4",
             "status": "online",
             "snowluma_onebot": {
                 "alive": status_res.get("ok", False),
