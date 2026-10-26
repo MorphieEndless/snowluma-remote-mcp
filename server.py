@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import logging
 import os
 import re
 import html
@@ -33,6 +34,10 @@ AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "change_me_to_a_secure_random_token")
 SNOWLUMA_API_BASE = os.getenv("SNOWLUMA_API_BASE", "http://127.0.0.1:3000").rstrip("/")
 SNOWLUMA_API_TOKEN = os.getenv("SNOWLUMA_API_TOKEN", "")
 TIMEOUT = float(os.getenv("SNOWLUMA_TIMEOUT", "30.0"))
+
+# 模块级 logger：set_msg_emoji_like 里原本直接用了 logger.warning 却没定义，
+# 一触发 warning 就 NameError，把「表情其实已经贴成功」的一次调用报成失败。
+logger = logging.getLogger("snowluma-mcp")
 
 _http_client: httpx.AsyncClient | None = None
 
@@ -566,6 +571,63 @@ def _reply_snippet(text: str, limit: int = REPLY_SNIPPET_LENGTH) -> str:
     return flat
 
 
+# CQ 码段类型 / 段数组的 type → 可读占位。主路径（段数组）和兜底路径（CQ 字符串）
+# 共用同一张表，免得同一条消息在两种格式下读起来不一样。
+SEGMENT_PLACEHOLDERS: dict[str, str] = {
+    "image": "[图片]",
+    "mface": "[表情包]",
+    "record": "[语音]",
+    "video": "[视频]",
+    "json": "[卡片消息]",
+    "xml": "[XML卡片]",
+    "markdown": "[Markdown]",
+    "poke": "[戳一戳]",
+    "dice": "[骰子]",
+    "rps": "[猜拳]",
+    "file": "[文件]",
+    "location": "[位置]",
+    "contact": "[名片]",
+    "music": "[音乐]",
+    "share": "[链接分享]",
+    "node": "[合并转发]",
+}
+
+
+def decode_cq_message(raw: str, reply_index: dict[str, tuple[str, str]]) -> str:
+    """把 CQ 码字符串解成可读文本。
+
+    什么时候会走到这里：message 字段本身是字符串（取决于 OneBot 实现的配置），
+    或者段数组解析完正文是空的、只剩 raw_message 可救。
+    段数组主路径对未知段给 [类型] 占位，这里用同一套占位表，保持两种格式口径一致。
+    """
+    decoded = html.unescape(str(raw or ""))
+
+    def _face(mo: re.Match) -> str:
+        raw_id = mo.group(1)
+        try:
+            return f"[{ID_TO_FACE_NAME.get(int(raw_id), f'表情:{raw_id}')}]"
+        except Exception:
+            return f"[表情:{raw_id}]"
+
+    def _reply(mo: re.Match) -> str:
+        target = reply_index.get(mo.group(1).strip())
+        if target:
+            return f"[回复 {target[0]}: {_reply_snippet(target[1])}]"
+        return "[回复]"
+
+    def _generic(mo: re.Match) -> str:
+        seg = mo.group(1).lower()
+        return SEGMENT_PLACEHOLDERS.get(seg, f"[{seg}]")
+
+    decoded = re.sub(r'\[CQ:face,id=([0-9]+)[^\]]*\]', _face, decoded)
+    decoded = re.sub(r'\[CQ:at,qq=([0-9]+)[^\]]*\]', r'@\1', decoded)
+    decoded = re.sub(r'\[CQ:reply,id=([^\]]+)\]', _reply, decoded)
+    decoded = re.sub(r'\[CQ:forward,id=([^\]]+)\]', r'[合并转发: \1]', decoded)
+    # 其余 [CQ:xxx,...] 一律换占位，别把原始 CQ 码丢给模型
+    decoded = re.sub(r'\[CQ:([A-Za-z_]+)(?:,[^\]]*)?\]', _generic, decoded)
+    return decoded.strip()
+
+
 def clean_message_history(raw_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """清洗 OneBot 历史消息列表，剥离冗余协议字段，智能提取纯文本、格式化时间与合并转发 ID"""
     clean_msgs = []
@@ -612,36 +674,21 @@ def clean_message_history(raw_messages: list[dict[str, Any]]) -> list[dict[str, 
                 elif stype == "video":
                     text_segments.append("[视频]")
                 else:
-                    text_segments.append(f"[{stype}]")
+                    text_segments.append(SEGMENT_PLACEHOLDERS.get(str(stype), f"[{stype}]"))
 
         raw_msg = m.get("raw_message", "")
-        if not forward_id and raw_msg:
-            match = re.search(r'\[CQ:forward,id=([^\]]+)\]', raw_msg)
+        # message 偶尔直接是 CQ 字符串而不是段数组（取决于实例配置）。这时它本身
+        # 就是可解析的来源；两者都空，这一条才真的没有可读内容。
+        msg_str = msg_list if isinstance(msg_list, str) else ""
+        cq_source = raw_msg or msg_str
+        if not forward_id and cq_source:
+            match = re.search(r'\[CQ:forward,id=([^\]]+)\]', cq_source)
             if match:
                 forward_id = match.group(1)
 
         content_str = "".join(text_segments).strip()
-        if not content_str and raw_msg:
-            decoded = html.unescape(raw_msg)
-            decoded = re.sub(r'\[CQ:image,[^\]]+\]', '[图片]', decoded)
-            decoded = re.sub(r'\[CQ:at,qq=([0-9]+)[^\]]*\]', r'@\1', decoded)
-            def _replace_reply(match_obj: re.Match) -> str:
-                target = reply_index.get(match_obj.group(1).strip())
-                if target:
-                    return f"[回复 {target[0]}: {_reply_snippet(target[1])}]"
-                return "[回复]"
-            decoded = re.sub(r'\[CQ:reply,id=([^\]]+)\]', _replace_reply, decoded)
-            decoded = re.sub(r'\[CQ:record,[^\]]+\]', '[语音]', decoded)
-            decoded = re.sub(r'\[CQ:video,[^\]]+\]', '[视频]', decoded)
-            def _replace_face(match_obj: re.Match) -> str:
-                raw_id = match_obj.group(1)
-                try:
-                    f_int = int(raw_id)
-                    return f"[{ID_TO_FACE_NAME.get(f_int, f'表情:{raw_id}')}]"
-                except Exception:
-                    return f"[表情:{raw_id}]"
-            decoded = re.sub(r'\[CQ:face,id=([0-9]+)[^\]]*\]', _replace_face, decoded)
-            content_str = decoded.strip()
+        if not content_str and cq_source:
+            content_str = decode_cq_message(cq_source, reply_index)
 
         sender = m.get("sender", {})
         sender_id = m.get("user_id") or sender.get("user_id")
@@ -693,7 +740,7 @@ def collect_message_ids(clean_msgs: list[dict[str, Any]]) -> list[int | None]:
 def build_text_payload(rendered_doc: str, clean_msgs: list[dict[str, Any]]) -> list[TextContent]:
     """text 模式的返回体：两个纯文本块，而不是一个 JSON 对象。
 
-    为什么不能是 JSON：JSON 里的换行会被转义成字面的 \n。客户端把工具结果当字符串渲染时
+    为什么不能是 JSON：JSON 里的换行会被转义成字面的 \\n。客户端把工具结果当字符串渲染时
     （RikkaHub 的 ToolUI.kt 就是这么做的），整段剧本会挤成一行，人没法核对解析结果。
     返回纯文本块时换行是真换行，客户端会原样排版。
 
@@ -880,7 +927,7 @@ def build_snowluma_mcp() -> FastMCP:
         - count: 获取条数（1~100，默认 20）
         - message_seq: 起始消息序号（用于向前翻页查询历史）
         - format: 输出格式，可选:
-            - 'text' (默认): 返回两段纯文本块（不是 JSON，所以换行不会被转义成 \n）：第一段是带序号的可读剧本（多行消息自动悬挂缩进），第二段是 {count, message_ids}，剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
+            - 'text' (默认): 返回两段纯文本块（不是 JSON，所以换行不会被转义成 \\n）：第一段是带序号的可读剧本（多行消息自动悬挂缩进），第二段是 {count, message_ids}，剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
             - 'compact': 结构化精简 JSON 数组，已剥离冗余协议字段、CDN 长链接与同值别名字段（不再输出 sender / content）
             - 'raw': 原始 OneBot 数据（仅供底层调试）
         """
@@ -925,7 +972,7 @@ def build_snowluma_mcp() -> FastMCP:
         - count: 获取条数（1~100，默认 20）
         - message_seq: 起始消息序号（用于向前翻页查询历史）
         - format: 输出格式，可选:
-            - 'text' (默认): 返回两段纯文本块（不是 JSON，所以换行不会被转义成 \n）：第一段是带序号的可读剧本（多行消息自动悬挂缩进），第二段是 {count, message_ids}，剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
+            - 'text' (默认): 返回两段纯文本块（不是 JSON，所以换行不会被转义成 \\n）：第一段是带序号的可读剧本（多行消息自动悬挂缩进），第二段是 {count, message_ids}，剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
             - 'compact': 结构化精简 JSON 数组，已剥离冗余协议字段、CDN 长链接与同值别名字段（不再输出 sender / content）
             - 'raw': 原始 OneBot 数据（仅供底层调试）
         """
@@ -966,7 +1013,7 @@ def build_snowluma_mcp() -> FastMCP:
         参数:
         - forward_id: 合并转发 ID（来自 CQ 码 [CQ:forward,id=...] 或 get_friend_msg_history 中的 forward_id 字段）
         - format: 输出格式，可选:
-            - 'text' (默认): 返回两段纯文本块（不是 JSON，所以换行不会被转义成 \n）：第一段是带序号的可读剧本（多行消息自动悬挂缩进），第二段是 {count, message_ids}，剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
+            - 'text' (默认): 返回两段纯文本块（不是 JSON，所以换行不会被转义成 \\n）：第一段是带序号的可读剧本（多行消息自动悬挂缩进），第二段是 {count, message_ids}，剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
             - 'compact': 结构化精简 JSON 数组，已剥离冗余字段、CDN 长链接与同值别名字段（不再输出 sender / content）
             - 'raw': 原始 OneBot 数据（仅供底层调试）
         """
@@ -1141,7 +1188,7 @@ def create_asgi_app() -> Starlette:
         login_res = await call_snowluma("get_login_info")
         return JSONResponse({
             "service": "snowluma-mcp",
-            "version": "1.2.4",
+            "version": "1.2.5",
             "status": "online",
             "snowluma_onebot": {
                 "alive": status_res.get("ok", False),
@@ -1165,6 +1212,10 @@ def create_asgi_app() -> Starlette:
 def main() -> None:
     import uvicorn
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
     print(f"[SnowLuma MCP] Starting on {HOST}:{PORT}, target OneBot: {SNOWLUMA_API_BASE}")
     asgi_app = create_asgi_app()
     uvicorn.run(asgi_app, host=HOST, port=PORT, log_level="info")
