@@ -38,7 +38,7 @@ Instead of wrapping bloated subprocess gateways like `supergateway` (which suffe
 ### Key Highlights
 - 🚀 **Native Remote Architecture**: Pure asynchronous ASGI service, zero subprocess wrappers, zero pipe stalls.
 - 🪶 **Extremely Lightweight**: Built on Python 3.12 + official `mcp` SDK; resident memory is only **~15 MB** (vs 100MB+ for Node.js suites).
-- 💬 **Tailored for AI Agents**: Flat, intuitive tooling for messaging, chat history retrieval, smart forward message unpacking, group management, and quotation replies (19 tools).
+- 💬 **Tailored for AI Agents**: Flat, intuitive tooling for messaging, chat history retrieval, smart forward message unpacking, group management, and quotation replies (20 tools).
 - ✨ **Full 280+ QQ System Reaction Support**: Built-in 345+ popular Chinese aliases & network memes directly mapped to Linux NTQQ official Reaction IDs, plus full integer ID passthrough.
 - 🛡️ **Hardened Production Security**: Bearer Token authentication, DNS-rebinding protection bypass for reverse proxies, and single-port HTTPS multiplexing.
 - ⚡ **Universal OneBot Pass-through**: Includes `call_onebot_action` to access all 170+ native OneBot v11 actions without writing extra code.
@@ -50,13 +50,13 @@ Instead of wrapping bloated subprocess gateways like `supergateway` (which suffe
 ```mermaid
 flowchart TD
     Client["📱 Mobile Client (Android RikkaHub)"] -->|"HTTPS POST + Bearer Token<br/>(Streamable HTTP: /mcp)"| Nginx["🌐 Nginx (Reverse Proxy)"]
-    Nginx -->|"HTTP (127.0.0.1:8766)"| MCP["⚡ SnowLuma Remote MCP Server (FastMCP ASGI)<br/>• BearerAuthMiddleware<br/>• 19 Standard Agent Tools<br/>• 280+ Official Reactions & 345+ Meme Map"]
+    Nginx -->|"HTTP (127.0.0.1:8766)"| MCP["⚡ SnowLuma Remote MCP Server (FastMCP ASGI)<br/>• BearerAuthMiddleware<br/>• 20 Standard Agent Tools<br/>• 280+ Official Reactions & 345+ Meme Map"]
     MCP -->|"HTTP POST (127.0.0.1:3000)"| SnowLuma["🐧 SnowLuma Runtime (Linux NTQQ + OneBot v11)"]
 ```
 
 ---
 
-## 🛠️ Tool Catalog (19 Tools)
+## 🛠️ Tool Catalog (20 Tools)
 
 ### 1. Messaging & Interaction
 | Tool | Description | Highlights |

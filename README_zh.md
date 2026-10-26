@@ -37,7 +37,7 @@
 **SnowLuma Remote MCP** 采用原生 **Python + FastMCP** 架构重构，彻底移除了子进程管道层：
 - 🚀 **原生远程架构**：纯异步 ASGI 网络服务，无子进程拉起，杜绝管道僵死与进程泄露。
 - 🪶 **极致轻量高效**：基于 Python 3.12 + 官方 MCP SDK 构建，常驻内存仅约 **15 MB**。
-- 💬 **为 AI Agent 量身定制**：精心封装了发送消息、拉取精简历史、@群友、引用回复、合并转发智能解析与群管理等 19 个扁平化高频工具。
+- 💬 **为 AI Agent 量身定制**：精心封装了发送消息、拉取精简历史、@群友、引用回复、合并转发智能解析与群管理等 20 个扁平化高频工具。
 - ✨ **独家全量 280+ 贴表情反应（Reaction）**：内置 345+ 常见中文别名与网络热梗（如 `尊嘟假嘟`、`给你一拳`、`菜狗`、`狗头`、`摸鱼`、`打call` 等），直通 Linux NTQQ 官方 Reaction 库，支持整数 ID 自由透传。
 - 🛡️ **生产级安全防护**：内置 Bearer Token 强校验中间件、反向代理穿透与防 DNS 重绑定白名单放行。
 - ⚡ **全能 OneBot 透传**：提供 `call_onebot_action` 万能接口，直接透传调用底层 170+ 个 OneBot v11 原生动作。
@@ -49,13 +49,13 @@
 ```mermaid
 flowchart TD
     Client["📱 移动端客户端 (Android RikkaHub)"] -->|"HTTPS POST + Bearer Token<br/>(Streamable HTTP: /mcp)"| Nginx["🌐 Nginx (反向代理网关)"]
-    Nginx -->|"HTTP (127.0.0.1:8766)"| MCP["⚡ SnowLuma Remote MCP 服务端 (FastMCP ASGI)<br/>• BearerAuthMiddleware 鉴权中间件<br/>• 19 个 Agent 原生工具<br/>• 280+ 全量系统表情与 345+ 别名映射库"]
+    Nginx -->|"HTTP (127.0.0.1:8766)"| MCP["⚡ SnowLuma Remote MCP 服务端 (FastMCP ASGI)<br/>• BearerAuthMiddleware 鉴权中间件<br/>• 20 个 Agent 原生工具<br/>• 280+ 全量系统表情与 345+ 别名映射库"]
     MCP -->|"HTTP POST (127.0.0.1:3000)"| SnowLuma["🐧 SnowLuma 运行时 (Linux NTQQ + OneBot v11)"]
 ```
 
 ---
 
-## 🛠️ 工具矩阵（19 个原生工具）
+## 🛠️ 工具矩阵（20 个原生工具）
 
 ### 1. 消息收发与轻量互动
 | 工具名称 | 功能说明 | 参数与核心亮点 |
@@ -183,7 +183,7 @@ location /mcp-health {
    - **名称**：`SnowLuma`
    - **URL**：`https://你的公网域名.com/mcp`
    - **Authorization**：`Bearer <你的_MCP_AUTH_TOKEN>`
-4. 保存后，进入 Agent 聊天界面，即可在工具托盘中看到 19 个全新工具！
+4. 保存后，进入 Agent 聊天界面，即可在工具托盘中看到 20 个全新工具！
 
 ---
 
