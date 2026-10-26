@@ -677,6 +677,14 @@ def clean_message_history(raw_messages: list[dict[str, Any]]) -> list[dict[str, 
     return clean_msgs
 
 
+def collect_message_ids(clean_msgs: list[dict[str, Any]]) -> list[int | None]:
+    """按消息顺序取出 message_id，与 rendered_text 的每一行逐一对应（取不到的位置为 null）。
+
+    只放 ID，不放其它字段：调用方拿它去引用回复 / 撤回 / 贴表情，不必为此再拉一次 compact。
+    """
+    return [m.get("message_id") for m in clean_msgs]
+
+
 def format_chat_message_item(sender_name: str, time_str: str, text: str) -> str:
     """将单条聊天记录格式化为优雅对齐的 Markdown 列表项。
     
@@ -845,7 +853,7 @@ def build_snowluma_mcp() -> FastMCP:
         - count: 获取条数（1~100，默认 20）
         - message_seq: 起始消息序号（用于向前翻页查询历史）
         - format: 输出格式，可选:
-            - 'text' (默认): 生成优雅对齐的 Markdown 对话剧本（自动处理多行悬挂缩进），极大节省 Token 且模型可直接阅读
+            - 'text' (默认): 生成优雅对齐的 Markdown 对话剧本（自动处理多行悬挂缩进），极大节省 Token 且模型可直接阅读；并附带 message_ids，与剧本逐行对齐，供引用/撤回/贴表情时取用
             - 'compact': 结构化精简 JSON 数组，已剥离所有冗余协议字段与 CDN 长链接
             - 'raw': 原始 OneBot 数据（仅供底层调试）
         """
@@ -879,6 +887,7 @@ def build_snowluma_mcp() -> FastMCP:
             "group_id": int(group_id),
             "count": len(clean_msgs),
             "rendered_text": rendered_doc,
+            "message_ids": collect_message_ids(clean_msgs),
         }
 
     @mcp.tool()
@@ -895,7 +904,7 @@ def build_snowluma_mcp() -> FastMCP:
         - count: 获取条数（1~100，默认 20）
         - message_seq: 起始消息序号（用于向前翻页查询历史）
         - format: 输出格式，可选:
-            - 'text' (默认): 生成优雅对齐的 Markdown 对话剧本（自动处理多行悬挂缩进），极大节省 Token 且模型可直接阅读
+            - 'text' (默认): 生成优雅对齐的 Markdown 对话剧本（自动处理多行悬挂缩进），极大节省 Token 且模型可直接阅读；并附带 message_ids，与剧本逐行对齐，供引用/撤回/贴表情时取用
             - 'compact': 结构化精简 JSON 数组，已剥离所有冗余协议字段与 CDN 长链接
             - 'raw': 原始 OneBot 数据（仅供底层调试）
         """
@@ -929,6 +938,7 @@ def build_snowluma_mcp() -> FastMCP:
             "user_id": int(user_id),
             "count": len(clean_msgs),
             "rendered_text": rendered_doc,
+            "message_ids": collect_message_ids(clean_msgs),
         }
 
     @mcp.tool()
@@ -941,7 +951,7 @@ def build_snowluma_mcp() -> FastMCP:
         参数:
         - forward_id: 合并转发 ID（来自 CQ 码 [CQ:forward,id=...] 或 get_friend_msg_history 中的 forward_id 字段）
         - format: 输出格式，可选:
-            - 'text' (默认): 生成优雅对齐的 Markdown 对话剧本（自动处理多行悬挂缩进），极大节省 Token 且模型可直接阅读
+            - 'text' (默认): 生成优雅对齐的 Markdown 对话剧本（自动处理多行悬挂缩进），极大节省 Token 且模型可直接阅读；并附带 message_ids，与剧本逐行对齐，供引用/撤回/贴表情时取用
             - 'compact': 结构化精简 JSON 数组，已剥离所有冗余字段与 CDN 长链接
             - 'raw': 原始 OneBot 数据（仅供底层调试）
         """
@@ -976,6 +986,7 @@ def build_snowluma_mcp() -> FastMCP:
             "forward_id": clean_id,
             "count": len(clean_msgs),
             "rendered_text": rendered_doc,
+            "message_ids": collect_message_ids(clean_msgs),
         }
 
     @mcp.tool()
@@ -1121,7 +1132,7 @@ def create_asgi_app() -> Starlette:
         login_res = await call_snowluma("get_login_info")
         return JSONResponse({
             "service": "snowluma-mcp",
-            "version": "1.2.1",
+            "version": "1.2.2",
             "status": "online",
             "snowluma_onebot": {
                 "alive": status_res.get("ok", False),
