@@ -552,10 +552,23 @@ async def call_snowluma(action: str, params: dict[str, Any] | None = None) -> di
         return {"ok": False, "error": f"请求 SnowLuma 异常: {type(exc).__name__} ({str(exc)})"}
 
 
+# 引用回复片段的最大字符数（超出部分截断为 …）
+REPLY_SNIPPET_LENGTH = 24
+
+
+def _reply_snippet(text: str, limit: int = REPLY_SNIPPET_LENGTH) -> str:
+    """把被引用消息压成单行短片段，用于 [回复 昵称: 片段] 的渲染。"""
+    flat = re.sub(r"\s+", " ", str(text or "")).strip()
+    if limit > 0 and len(flat) > limit:
+        return flat[:limit] + "…"
+    return flat
+
 
 def clean_message_history(raw_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """清洗 OneBot 历史消息列表，剥离冗余协议字段，智能提取纯文本、格式化时间与合并转发 ID"""
     clean_msgs = []
+    # message_id -> (发送者昵称, 已清洗正文)，用于把引用回复还原成 [回复 谁: 说了什么]
+    reply_index: dict[str, tuple[str, str]] = {}
     for m in raw_messages:
         forward_id = None
         text_segments = []
@@ -581,7 +594,14 @@ def clean_message_history(raw_messages: list[dict[str, Any]]) -> list[dict[str, 
                     except Exception:
                         text_segments.append(f"[表情:{fid_raw}]")
                 elif stype == "reply":
-                    text_segments.append("[回复]")
+                    target = reply_index.get(str(sdata.get("id") or "").strip())
+                    quoted = sdata.get("text")
+                    if target:
+                        text_segments.append(f"[回复 {target[0]}: {_reply_snippet(target[1])}]")
+                    elif quoted:
+                        text_segments.append(f"[回复 {_reply_snippet(quoted)}]")
+                    else:
+                        text_segments.append("[回复]")
                 elif stype == "at":
                     qq = sdata.get("qq", "")
                     text_segments.append(f"@{qq}")
@@ -603,7 +623,12 @@ def clean_message_history(raw_messages: list[dict[str, Any]]) -> list[dict[str, 
             decoded = html.unescape(raw_msg)
             decoded = re.sub(r'\[CQ:image,[^\]]+\]', '[图片]', decoded)
             decoded = re.sub(r'\[CQ:at,qq=([0-9]+)[^\]]*\]', r'@\1', decoded)
-            decoded = re.sub(r'\[CQ:reply,[^\]]+\]', '[回复]', decoded)
+            def _replace_reply(match_obj: re.Match) -> str:
+                target = reply_index.get(match_obj.group(1).strip())
+                if target:
+                    return f"[回复 {target[0]}: {_reply_snippet(target[1])}]"
+                return "[回复]"
+            decoded = re.sub(r'\[CQ:reply,id=([^\]]+)\]', _replace_reply, decoded)
             decoded = re.sub(r'\[CQ:record,[^\]]+\]', '[语音]', decoded)
             decoded = re.sub(r'\[CQ:video,[^\]]+\]', '[视频]', decoded)
             def _replace_face(match_obj: re.Match) -> str:
@@ -629,6 +654,10 @@ def clean_message_history(raw_messages: list[dict[str, Any]]) -> list[dict[str, 
                 time_str = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
             except Exception:
                 time_str = str(ts)
+
+        mid = m.get("message_id")
+        if mid is not None:
+            reply_index[str(mid)] = (sender_name, content_str)
 
         entry = {
             "message_id": m.get("message_id"),
@@ -850,7 +879,6 @@ def build_snowluma_mcp() -> FastMCP:
             "group_id": int(group_id),
             "count": len(clean_msgs),
             "rendered_text": rendered_doc,
-            "messages": clean_msgs,
         }
 
     @mcp.tool()
@@ -901,7 +929,6 @@ def build_snowluma_mcp() -> FastMCP:
             "user_id": int(user_id),
             "count": len(clean_msgs),
             "rendered_text": rendered_doc,
-            "messages": clean_msgs,
         }
 
     @mcp.tool()
@@ -949,7 +976,6 @@ def build_snowluma_mcp() -> FastMCP:
             "forward_id": clean_id,
             "count": len(clean_msgs),
             "rendered_text": rendered_doc,
-            "messages": clean_msgs,
         }
 
     @mcp.tool()
@@ -1095,7 +1121,7 @@ def create_asgi_app() -> Starlette:
         login_res = await call_snowluma("get_login_info")
         return JSONResponse({
             "service": "snowluma-mcp",
-            "version": "1.2.0",
+            "version": "1.2.1",
             "status": "online",
             "snowluma_onebot": {
                 "alive": status_res.get("ok", False),
