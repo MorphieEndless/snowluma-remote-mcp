@@ -11,6 +11,7 @@ import asyncio
 import datetime
 import os
 import re
+import html
 import sys
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -391,6 +392,12 @@ EMOJI_NAME_MAP: dict[str, int] = {
 }
 
 
+ID_TO_FACE_NAME: dict[int, str] = {}
+for _name, _fid in EMOJI_NAME_MAP.items():
+    if _fid not in ID_TO_FACE_NAME:
+        ID_TO_FACE_NAME[_fid] = _name
+
+
 # ---------------- 现代 Emoji 平替映射与白名单体系 ----------------
 # 全局运行模式：默认 mapping (自动平替并警告)，可设为 strict / ban (严格拦截)
 EMOJI_REACTION_MODE = os.getenv("EMOJI_REACTION_MODE", "mapping").lower()
@@ -545,8 +552,9 @@ async def call_snowluma(action: str, params: dict[str, Any] | None = None) -> di
         return {"ok": False, "error": f"请求 SnowLuma 异常: {type(exc).__name__} ({str(exc)})"}
 
 
+
 def clean_message_history(raw_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """清洗 OneBot 历史消息列表，剥离冗余字段，智能提取纯文本与合并转发 ID"""
+    """清洗 OneBot 历史消息列表，剥离冗余协议字段，智能提取纯文本、格式化时间与合并转发 ID"""
     clean_msgs = []
     for m in raw_messages:
         forward_id = None
@@ -565,10 +573,22 @@ def clean_message_history(raw_messages: list[dict[str, Any]]) -> list[dict[str, 
                     forward_id = fid
                     text_segments.append(f"[合并转发: {fid}]")
                 elif stype == "face":
-                    fid = sdata.get("id")
-                    text_segments.append(f"[表情:{fid}]")
+                    fid_raw = sdata.get("id")
+                    try:
+                        fid_int = int(fid_raw)
+                        face_name = ID_TO_FACE_NAME.get(fid_int, f"表情:{fid_raw}")
+                        text_segments.append(f"[{face_name}]")
+                    except Exception:
+                        text_segments.append(f"[表情:{fid_raw}]")
                 elif stype == "reply":
                     text_segments.append("[回复]")
+                elif stype == "at":
+                    qq = sdata.get("qq", "")
+                    text_segments.append(f"@{qq}")
+                elif stype == "record":
+                    text_segments.append("[语音]")
+                elif stype == "video":
+                    text_segments.append("[视频]")
                 else:
                     text_segments.append(f"[{stype}]")
 
@@ -578,18 +598,97 @@ def clean_message_history(raw_messages: list[dict[str, Any]]) -> list[dict[str, 
             if match:
                 forward_id = match.group(1)
 
+        content_str = "".join(text_segments).strip()
+        if not content_str and raw_msg:
+            decoded = html.unescape(raw_msg)
+            decoded = re.sub(r'\[CQ:image,[^\]]+\]', '[图片]', decoded)
+            decoded = re.sub(r'\[CQ:at,qq=([0-9]+)[^\]]*\]', r'@\1', decoded)
+            decoded = re.sub(r'\[CQ:reply,[^\]]+\]', '[回复]', decoded)
+            decoded = re.sub(r'\[CQ:record,[^\]]+\]', '[语音]', decoded)
+            decoded = re.sub(r'\[CQ:video,[^\]]+\]', '[视频]', decoded)
+            def _replace_face(match_obj: re.Match) -> str:
+                raw_id = match_obj.group(1)
+                try:
+                    f_int = int(raw_id)
+                    return f"[{ID_TO_FACE_NAME.get(f_int, f'表情:{raw_id}')}]"
+                except Exception:
+                    return f"[表情:{raw_id}]"
+            decoded = re.sub(r'\[CQ:face,id=([0-9]+)[^\]]*\]', _replace_face, decoded)
+            content_str = decoded.strip()
+
+        sender = m.get("sender", {})
+        sender_id = m.get("user_id") or sender.get("user_id")
+        nickname = sender.get("nickname") or ""
+        card = sender.get("card") or ""
+        sender_name = card or nickname or str(sender_id or "未知")
+
+        ts = m.get("time")
+        time_str = ""
+        if ts:
+            try:
+                time_str = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+            except Exception:
+                time_str = str(ts)
+
         entry = {
             "message_id": m.get("message_id"),
-            "sender_id": m.get("sender", {}).get("user_id"),
-            "nickname": m.get("sender", {}).get("nickname") or m.get("sender", {}).get("card"),
-            "time": m.get("time"),
-            "text": "".join(text_segments).strip() or raw_msg,
+            "sender_id": sender_id,
+            "sender_name": sender_name,
+            "sender": sender_name,
+            "nickname": nickname or card or sender_name,
+            "time": ts,
+            "time_str": time_str,
+            "text": content_str,
+            "content": content_str,
             "raw_message": raw_msg,
         }
         if forward_id:
             entry["forward_id"] = forward_id
         clean_msgs.append(entry)
     return clean_msgs
+
+
+def format_chat_message_item(sender_name: str, time_str: str, text: str) -> str:
+    """将单条聊天记录格式化为优雅对齐的 Markdown 列表项。
+    
+    对于多行消息：
+    - 首行前缀: - [HH:MM:SS] **Sender**: 第一行  
+    - 后续各行使用 2 个空格严格悬挂缩进对齐，并在行尾添加标准 Markdown 硬换行标记（两个空格），
+      确保在任何 Markdown 引擎中均作为同一列表条目内部的排版展示，绝不破坏列表结构或突兀顶格。
+    """
+    t_prefix = f"[{time_str}] " if time_str else ""
+    prefix = f"- {t_prefix}**{sender_name}**: "
+
+    if not text:
+        return f"{prefix}"
+
+    lines = text.split("\n")
+    if not lines:
+        return f"{prefix}"
+
+    if len(lines) == 1:
+        return f"{prefix}{lines[0]}"
+
+    formatted = [f"{prefix}{lines[0]}  "]
+    for idx, subline in enumerate(lines[1:], 1):
+        if idx == len(lines) - 1:
+            formatted.append(f"  {subline}")
+        else:
+            formatted.append(f"  {subline}  ")
+    return "\n".join(formatted)
+
+
+def render_chat_transcript(title: str, clean_msgs: list[dict[str, Any]]) -> str:
+    """将清洗后的消息列表渲染为完整的优雅 Markdown 对话剧本。"""
+    lines = []
+    for m in clean_msgs:
+        sname = m.get("sender_name") or m.get("nickname") or str(m.get("sender_id", "未知"))
+        tstr = m.get("time_str", "")
+        txt = m.get("text", "")
+        lines.append(format_chat_message_item(sname, tstr, txt))
+
+    body = "\n".join(lines)
+    return f"{title}\n{body}"
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -708,8 +807,19 @@ def build_snowluma_mcp() -> FastMCP:
         group_id: int,
         count: int = 20,
         message_seq: int | None = None,
+        format: str = "text",
     ) -> dict[str, Any]:
-        """获取指定群的最近历史消息记录。count 默认为 20 条，便于理解上下文。"""
+        """获取指定群的最近历史消息记录。count 默认为 20 条，便于理解上下文。
+        
+        参数:
+        - group_id: 目标群号
+        - count: 获取条数（1~100，默认 20）
+        - message_seq: 起始消息序号（用于向前翻页查询历史）
+        - format: 输出格式，可选:
+            - 'text' (默认): 生成优雅对齐的 Markdown 对话剧本（自动处理多行悬挂缩进），极大节省 Token 且模型可直接阅读
+            - 'compact': 结构化精简 JSON 数组，已剥离所有冗余协议字段与 CDN 长链接
+            - 'raw': 原始 OneBot 数据（仅供底层调试）
+        """
         params: dict[str, Any] = {"group_id": int(group_id), "count": min(max(int(count), 1), 100)}
         if message_seq is not None:
             params["message_seq"] = int(message_seq)
@@ -717,12 +827,29 @@ def build_snowluma_mcp() -> FastMCP:
         if not res.get("ok"):
             return res
 
+        if format == "raw":
+            return res
+
         raw_messages = res.get("data", {}).get("messages", [])
         clean_msgs = clean_message_history(raw_messages)
+
+        if format == "compact":
+            return {
+                "ok": True,
+                "group_id": int(group_id),
+                "count": len(clean_msgs),
+                "messages": clean_msgs,
+            }
+
+        rendered_doc = render_chat_transcript(
+            f"### 群聊历史记录 (群号: {group_id}，共 {len(clean_msgs)} 条消息)",
+            clean_msgs,
+        )
         return {
             "ok": True,
             "group_id": int(group_id),
             "count": len(clean_msgs),
+            "rendered_text": rendered_doc,
             "messages": clean_msgs,
         }
 
@@ -731,6 +858,7 @@ def build_snowluma_mcp() -> FastMCP:
         user_id: int,
         count: int = 20,
         message_seq: int | None = None,
+        format: str = "text",
     ) -> dict[str, Any]:
         """获取指定好友/私聊对象的最近历史消息记录。
         
@@ -738,6 +866,10 @@ def build_snowluma_mcp() -> FastMCP:
         - user_id: 目标好友 QQ 号
         - count: 获取条数（1~100，默认 20）
         - message_seq: 起始消息序号（用于向前翻页查询历史）
+        - format: 输出格式，可选:
+            - 'text' (默认): 生成优雅对齐的 Markdown 对话剧本（自动处理多行悬挂缩进），极大节省 Token 且模型可直接阅读
+            - 'compact': 结构化精简 JSON 数组，已剥离所有冗余协议字段与 CDN 长链接
+            - 'raw': 原始 OneBot 数据（仅供底层调试）
         """
         params: dict[str, Any] = {"user_id": int(user_id), "count": min(max(int(count), 1), 100)}
         if message_seq is not None:
@@ -746,12 +878,29 @@ def build_snowluma_mcp() -> FastMCP:
         if not res.get("ok"):
             return res
 
+        if format == "raw":
+            return res
+
         raw_messages = res.get("data", {}).get("messages", [])
         clean_msgs = clean_message_history(raw_messages)
+
+        if format == "compact":
+            return {
+                "ok": True,
+                "user_id": int(user_id),
+                "count": len(clean_msgs),
+                "messages": clean_msgs,
+            }
+
+        rendered_doc = render_chat_transcript(
+            f"### 私聊历史记录 (QQ: {user_id}，共 {len(clean_msgs)} 条消息)",
+            clean_msgs,
+        )
         return {
             "ok": True,
             "user_id": int(user_id),
             "count": len(clean_msgs),
+            "rendered_text": rendered_doc,
             "messages": clean_msgs,
         }
 
@@ -765,7 +914,7 @@ def build_snowluma_mcp() -> FastMCP:
         参数:
         - forward_id: 合并转发 ID（来自 CQ 码 [CQ:forward,id=...] 或 get_friend_msg_history 中的 forward_id 字段）
         - format: 输出格式，可选:
-            - 'text' (默认): 生成易读的 Markdown 对话剧本，极大节省 Token 且模型可直接阅读
+            - 'text' (默认): 生成优雅对齐的 Markdown 对话剧本（自动处理多行悬挂缩进），极大节省 Token 且模型可直接阅读
             - 'compact': 结构化精简 JSON 数组，已剥离所有冗余字段与 CDN 长链接
             - 'raw': 原始 OneBot 数据（仅供底层调试）
         """
@@ -781,85 +930,27 @@ def build_snowluma_mcp() -> FastMCP:
             return res
 
         raw_messages = res.get("data", {}).get("messages", [])
-        
-        # 建立 Face ID -> 中文表情名称映射
-        id_to_face = {}
-        for name, fid in EMOJI_NAME_MAP.items():
-            if fid not in id_to_face:
-                id_to_face[fid] = name
-
-        parsed_msgs = []
-        text_lines = []
-
-        for idx, m in enumerate(raw_messages, 1):
-            sender = m.get("sender", {})
-            sender_name = sender.get("card") or sender.get("nickname") or str(m.get("user_id", "未知"))
-            sender_id = m.get("user_id") or sender.get("user_id")
-            
-            ts = m.get("time")
-            time_str = ""
-            if ts:
-                try:
-                    time_str = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-                except Exception:
-                    time_str = str(ts)
-
-            parts = []
-            msg_elements = m.get("message", [])
-            if isinstance(msg_elements, list):
-                for elem in msg_elements:
-                    etype = elem.get("type")
-                    edata = elem.get("data", {})
-                    if etype == "text":
-                        parts.append(edata.get("text", ""))
-                    elif etype == "image":
-                        parts.append("[图片]")
-                    elif etype == "face":
-                        fid_raw = edata.get("id")
-                        try:
-                            fid_int = int(fid_raw)
-                            parts.append(f"[{id_to_face.get(fid_int, f'表情:{fid_raw}')}]")
-                        except Exception:
-                            parts.append(f"[表情:{fid_raw}]")
-                    elif etype == "reply":
-                        parts.append("[回复]")
-                    elif etype == "forward":
-                        parts.append(f"[嵌套转发: {edata.get('id', '')}]")
-                    elif etype == "at":
-                        parts.append(f"@{edata.get('qq', '')}")
-                    else:
-                        parts.append(f"[{etype}]")
-
-            content = "".join(parts).strip() or m.get("raw_message", "")
-            
-            parsed_msgs.append({
-                "index": idx,
-                "sender": sender_name,
-                "user_id": sender_id,
-                "time": time_str,
-                "content": content,
-            })
-            
-            t_prefix = f"[{time_str}] " if time_str else ""
-            text_lines.append(f"- {t_prefix}**{sender_name}**: {content}")
+        clean_msgs = clean_message_history(raw_messages)
 
         if format == "compact":
             return {
                 "ok": True,
                 "forward_id": clean_id,
-                "count": len(parsed_msgs),
-                "messages": parsed_msgs,
+                "count": len(clean_msgs),
+                "messages": clean_msgs,
             }
 
-        lines_joined = "\n".join(text_lines)
-        rendered_doc = f"### 合并转发记录（共 {len(parsed_msgs)} 条消息）\n{lines_joined}"
+        rendered_doc = render_chat_transcript(
+            f"### 合并转发记录（共 {len(clean_msgs)} 条消息）",
+            clean_msgs,
+        )
         return {
             "ok": True,
             "forward_id": clean_id,
-            "count": len(parsed_msgs),
+            "count": len(clean_msgs),
             "rendered_text": rendered_doc,
+            "messages": clean_msgs,
         }
-
 
     @mcp.tool()
     async def set_msg_emoji_like(
@@ -1004,7 +1095,7 @@ def create_asgi_app() -> Starlette:
         login_res = await call_snowluma("get_login_info")
         return JSONResponse({
             "service": "snowluma-mcp",
-            "version": "1.1.0",
+            "version": "1.2.0",
             "status": "online",
             "snowluma_onebot": {
                 "alive": status_res.get("ok", False),
