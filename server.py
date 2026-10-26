@@ -662,39 +662,45 @@ def clean_message_history(raw_messages: list[dict[str, Any]]) -> list[dict[str, 
         entry = {
             "message_id": m.get("message_id"),
             "sender_id": sender_id,
+            # 群名片优先（没有则退回昵称）：agent 眼里的"这个人现在叫什么"
             "sender_name": sender_name,
-            "sender": sender_name,
+            # 原始昵称：群名片存在时它与 sender_name 不同，用于跟记忆里的名字对齐
             "nickname": nickname or card or sender_name,
             "time": ts,
             "time_str": time_str,
             "text": content_str,
-            "content": content_str,
-            "raw_message": raw_msg,
         }
         if forward_id:
             entry["forward_id"] = forward_id
+        # raw_message 在转发包里基本都是空串，空就不占位
+        if raw_msg:
+            entry["raw_message"] = raw_msg
         clean_msgs.append(entry)
     return clean_msgs
 
 
 def collect_message_ids(clean_msgs: list[dict[str, Any]]) -> list[int | None]:
-    """按消息顺序取出 message_id，与 rendered_text 的每一行逐一对应（取不到的位置为 null）。
+    """按消息顺序取出 message_id，与 rendered_text 的每一条逐一对应（取不到的位置为 null）。
 
     只放 ID，不放其它字段：调用方拿它去引用回复 / 撤回 / 贴表情，不必为此再拉一次 compact。
+    对应关系是"第 N 条 → message_ids[N-1]"，第 N 条在渲染文本里就以 N. 开头，不需要数行。
     """
     return [m.get("message_id") for m in clean_msgs]
 
 
-def format_chat_message_item(sender_name: str, time_str: str, text: str) -> str:
-    """将单条聊天记录格式化为优雅对齐的 Markdown 列表项。
-    
-    对于多行消息：
-    - 首行前缀: - [HH:MM:SS] **Sender**: 第一行  
-    - 后续各行使用 2 个空格严格悬挂缩进对齐，并在行尾添加标准 Markdown 硬换行标记（两个空格），
-      确保在任何 Markdown 引擎中均作为同一列表条目内部的排版展示，绝不破坏列表结构或突兀顶格。
+def format_chat_message_item(index: int, sender_name: str, time_str: str, text: str) -> str:
+    """将单条聊天记录格式化为有序列表项，行首编号即这条消息在本次结果中的序号。
+
+    编号的用处：message_ids[index - 1] 就是这一条的 message_id，不必去数渲染后的行数
+    （多行消息会占好几行，数行必然数错）。人工核对解析结果时也能直接按编号指认"第几条不对"。
+
+    多行消息的处理：
+    - 首行前缀: N. [HH:MM:SS] **昵称**: 第一行
+    - 后续各行按 3 个空格悬挂缩进（与 "N. " 等宽）并在行尾补 Markdown 硬换行标记，
+      保证在各类 Markdown 引擎里都留在同一条列表项内部，不破坏列表结构、不突兀顶格。
     """
     t_prefix = f"[{time_str}] " if time_str else ""
-    prefix = f"- {t_prefix}**{sender_name}**: "
+    prefix = f"{index}. {t_prefix}**{sender_name}**: "
 
     if not text:
         return f"{prefix}"
@@ -707,22 +713,20 @@ def format_chat_message_item(sender_name: str, time_str: str, text: str) -> str:
         return f"{prefix}{lines[0]}"
 
     formatted = [f"{prefix}{lines[0]}  "]
-    for idx, subline in enumerate(lines[1:], 1):
-        if idx == len(lines) - 1:
-            formatted.append(f"  {subline}")
-        else:
-            formatted.append(f"  {subline}  ")
+    for i, subline in enumerate(lines[1:], 1):
+        tail = "  " if i != len(lines) - 1 else ""
+        formatted.append(f"   {subline}{tail}")
     return "\n".join(formatted)
 
 
 def render_chat_transcript(title: str, clean_msgs: list[dict[str, Any]]) -> str:
-    """将清洗后的消息列表渲染为完整的优雅 Markdown 对话剧本。"""
+    """将清洗后的消息列表渲染为完整的 Markdown 对话剧本（带序号，便于人核对与精确定位）。"""
     lines = []
-    for m in clean_msgs:
+    for index, m in enumerate(clean_msgs, 1):
         sname = m.get("sender_name") or m.get("nickname") or str(m.get("sender_id", "未知"))
         tstr = m.get("time_str", "")
         txt = m.get("text", "")
-        lines.append(format_chat_message_item(sname, tstr, txt))
+        lines.append(format_chat_message_item(index, sname, tstr, txt))
 
     body = "\n".join(lines)
     return f"{title}\n{body}"
@@ -853,8 +857,8 @@ def build_snowluma_mcp() -> FastMCP:
         - count: 获取条数（1~100，默认 20）
         - message_seq: 起始消息序号（用于向前翻页查询历史）
         - format: 输出格式，可选:
-            - 'text' (默认): 生成优雅对齐的 Markdown 对话剧本（自动处理多行悬挂缩进），极大节省 Token 且模型可直接阅读；并附带 message_ids，与剧本逐行对齐，供引用/撤回/贴表情时取用
-            - 'compact': 结构化精简 JSON 数组，已剥离所有冗余协议字段与 CDN 长链接
+            - 'text' (默认): 生成带序号的人类可读 Markdown 剧本（多行消息自动悬挂缩进），并附带 message_ids；剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
+            - 'compact': 结构化精简 JSON 数组，已剥离冗余协议字段、CDN 长链接与同值别名字段（不再输出 sender / content）
             - 'raw': 原始 OneBot 数据（仅供底层调试）
         """
         params: dict[str, Any] = {"group_id": int(group_id), "count": min(max(int(count), 1), 100)}
@@ -904,8 +908,8 @@ def build_snowluma_mcp() -> FastMCP:
         - count: 获取条数（1~100，默认 20）
         - message_seq: 起始消息序号（用于向前翻页查询历史）
         - format: 输出格式，可选:
-            - 'text' (默认): 生成优雅对齐的 Markdown 对话剧本（自动处理多行悬挂缩进），极大节省 Token 且模型可直接阅读；并附带 message_ids，与剧本逐行对齐，供引用/撤回/贴表情时取用
-            - 'compact': 结构化精简 JSON 数组，已剥离所有冗余协议字段与 CDN 长链接
+            - 'text' (默认): 生成带序号的人类可读 Markdown 剧本（多行消息自动悬挂缩进），并附带 message_ids；剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
+            - 'compact': 结构化精简 JSON 数组，已剥离冗余协议字段、CDN 长链接与同值别名字段（不再输出 sender / content）
             - 'raw': 原始 OneBot 数据（仅供底层调试）
         """
         params: dict[str, Any] = {"user_id": int(user_id), "count": min(max(int(count), 1), 100)}
@@ -951,8 +955,8 @@ def build_snowluma_mcp() -> FastMCP:
         参数:
         - forward_id: 合并转发 ID（来自 CQ 码 [CQ:forward,id=...] 或 get_friend_msg_history 中的 forward_id 字段）
         - format: 输出格式，可选:
-            - 'text' (默认): 生成优雅对齐的 Markdown 对话剧本（自动处理多行悬挂缩进），极大节省 Token 且模型可直接阅读；并附带 message_ids，与剧本逐行对齐，供引用/撤回/贴表情时取用
-            - 'compact': 结构化精简 JSON 数组，已剥离所有冗余字段与 CDN 长链接
+            - 'text' (默认): 生成带序号的人类可读 Markdown 剧本（多行消息自动悬挂缩进），并附带 message_ids；剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
+            - 'compact': 结构化精简 JSON 数组，已剥离冗余字段、CDN 长链接与同值别名字段（不再输出 sender / content）
             - 'raw': 原始 OneBot 数据（仅供底层调试）
         """
         clean_id = str(forward_id).strip()
@@ -1132,7 +1136,7 @@ def create_asgi_app() -> Starlette:
         login_res = await call_snowluma("get_login_info")
         return JSONResponse({
             "service": "snowluma-mcp",
-            "version": "1.2.2",
+            "version": "1.2.3",
             "status": "online",
             "snowluma_onebot": {
                 "alive": status_res.get("ok", False),
