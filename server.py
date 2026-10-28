@@ -563,16 +563,120 @@ async def call_snowluma(action: str, params: dict[str, Any] | None = None) -> di
 REPLY_SNIPPET_LENGTH = 24
 
 
+# 控制字符：真实消息正文里不会有，出现了就说明这段数据是二进制/加密块
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _looks_binary(text: Any) -> bool:
+    """reply 段偶尔把二进制块塞在 text 字段里，这种不能当引用内容渲染。"""
+    return bool(_CONTROL_CHARS.search(str(text or "")))
+
+
 def _reply_snippet(text: str, limit: int = REPLY_SNIPPET_LENGTH) -> str:
     """把被引用消息压成单行短片段，用于 [回复 昵称: 片段] 的渲染。"""
-    flat = re.sub(r"\s+", " ", str(text or "")).strip()
+    flat = re.sub(r"\s+", " ", _CONTROL_CHARS.sub("", str(text or ""))).strip()
     if limit > 0 and len(flat) > limit:
         return flat[:limit] + "…"
     return flat
 
 
+# ---------------- 媒体段（图片 / 动画表情 / 商城表情） ----------------
+#
+# SnowLuma（NTQQ）不会发 mface 段：QQ 的所有媒体都落在 type=image 里，靠 sub_type
+# 和 emoji_id 区分。实测分布：
+#   sub_type=0，无 emoji_id                  → 普通图片（summary 恒为 [图片]）
+#   sub_type=0，带 emoji_id/emoji_package_id → 老式商城表情，url 在 gxh.vip.qq.com，summary 是表情名
+#   sub_type=1                               → 动画表情（GIF/动图表情，summary 恒为 [动画表情]）
+#   sub_type=7                               → 商城表情包，summary 就是中文名（[迷你世界] 之类）
+#   sub_type=13                              → 同样标 [动画表情]，按动画表情处理
+#
+# 这三类在聊天里含义完全不同（普通图片是内容，动画表情是语气，商城表情带名字），
+# 占位必须分开，否则模型会把"发了个表情"读成"发了张图"。
+IMAGE_SUBTYPE_STICKER = (1, 13)
+IMAGE_SUBTYPE_MFACE = (7,)
+
+# summary 里这类名字没有信息量，不能当表情名用
+_GENERIC_MEDIA_SUMMARIES = {"[图片]", "[动画表情]", "[表情包]", "[动图]", ""}
+
+
+def _unescape_cq(value: str) -> str:
+    """还原 CQ 码里的实体转义（[ ] , & 在 CQ 码里必须写成实体）。"""
+    for entity, char in (("&#91;", "["), ("&#93;", "]"), ("&#44;", ","), ("&amp;", "&")):
+        value = value.replace(entity, char)
+    return value
+
+
+def _parse_cq_params(raw: str) -> dict[str, str]:
+    """把 CQ 码里 CQ:xxx,a=1,b=2 的逗号参数段拆成字典。
+
+    summary 里会再套一层 [动画表情] 这种方括号（写成 &#91;动画表情&#93;），
+    所以先按逗号切分，再还原实体，免得把值里的逗号也切掉。
+    """
+    params: dict[str, str] = {}
+    for chunk in str(raw or "").split(","):
+        if "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        params[key.strip().lower()] = _unescape_cq(value.strip())
+    return params
+
+
+def _media_name(summary: Any) -> str:
+    """从 summary 里取表情名：只认 [名字] 这种带方括号、且不是通用占位的内容。"""
+    text = str(summary or "").strip()
+    if text in _GENERIC_MEDIA_SUMMARIES:
+        return ""
+    if text.startswith("[") and text.endswith("]"):
+        inner = text[1:-1].strip()
+        return "" if inner in ("图片", "动画表情", "表情包", "动图") else inner
+    return ""
+
+
+def classify_media(seg_type: Any, data: dict[str, Any]) -> tuple[str, str]:
+    """判断一个媒体段到底是什么，返回 (类别, 占位文本)。
+
+    类别取 "image" / "sticker" / "mface"，去重时按类别 + 身份键分组。
+    """
+    stype = str(seg_type or "").lower()
+    try:
+        sub_type: int | None = int(data.get("sub_type"))
+    except (TypeError, ValueError):
+        sub_type = None
+    name = _media_name(data.get("summary"))
+
+    if stype == "mface":
+        # 其他 OneBot 实现会单独发 mface 段（QQ 商城表情）
+        return "mface", f"[表情包:{name}]" if name else "[表情包]"
+    if sub_type in IMAGE_SUBTYPE_MFACE or data.get("emoji_id") or data.get("emoji_package_id"):
+        return "mface", f"[表情包:{name}]" if name else "[表情包]"
+    if sub_type in IMAGE_SUBTYPE_STICKER:
+        return "sticker", "[动画表情]"
+    return "image", "[图片]"
+
+
+def media_identity(data: dict[str, Any]) -> str:
+    """同一张图/表情的稳定身份。
+
+    QQ 段里的 file 字段就是图片字节的 MD5（大写），不用下载就能拿到，直接当去重键；
+    别的实现给 file_id/md5 时一并兜住。取不到就返回空串（不做去重）。
+    """
+    for key in ("file", "file_id", "md5"):
+        value = str(data.get(key) or "").strip()
+        if value:
+            return value.rsplit("/", 1)[-1].lower()
+    return ""
+
+
+def _append_media_ref(label: str, ref: int) -> str:
+    """给重复出现的媒体占位补一个"同#N"，指向同一张图第一次出现的那条消息编号。"""
+    if label.endswith("]"):
+        return f"{label[:-1]} 同#{ref}]"
+    return f"{label} 同#{ref}"
+
+
 # CQ 码段类型 / 段数组的 type → 可读占位。主路径（段数组）和兜底路径（CQ 字符串）
 # 共用同一张表，免得同一条消息在两种格式下读起来不一样。
+# image / mface 走 classify_media()，这里只留作最终兜底。
 SEGMENT_PLACEHOLDERS: dict[str, str] = {
     "image": "[图片]",
     "mface": "[表情包]",
@@ -600,7 +704,9 @@ def decode_cq_message(raw: str, reply_index: dict[str, tuple[str, str]]) -> str:
     或者段数组解析完正文是空的、只剩 raw_message 可救。
     段数组主路径对未知段给 [类型] 占位，这里用同一套占位表，保持两种格式口径一致。
     """
-    decoded = html.unescape(str(raw or ""))
+    # 注意：html.unescape 要放在最后。CQ 码把 [ ] 写成实体，提前还原的话
+    # summary=&#91;动画表情&#93; 里的 ] 会把 CQ 段的正则提前截断，尾巴多出一个 ]。
+    decoded = str(raw or "")
 
     def _face(mo: re.Match) -> str:
         raw_id = mo.group(1)
@@ -615,6 +721,10 @@ def decode_cq_message(raw: str, reply_index: dict[str, tuple[str, str]]) -> str:
             return f"[回复 {target[0]}: {_reply_snippet(target[1])}]"
         return "[回复]"
 
+    def _media(mo: re.Match) -> str:
+        _, label = classify_media(mo.group(1), _parse_cq_params(mo.group(2) or ""))
+        return label
+
     def _generic(mo: re.Match) -> str:
         seg = mo.group(1).lower()
         return SEGMENT_PLACEHOLDERS.get(seg, f"[{seg}]")
@@ -622,10 +732,12 @@ def decode_cq_message(raw: str, reply_index: dict[str, tuple[str, str]]) -> str:
     decoded = re.sub(r'\[CQ:face,id=([0-9]+)[^\]]*\]', _face, decoded)
     decoded = re.sub(r'\[CQ:at,qq=([0-9]+)[^\]]*\]', r'@\1', decoded)
     decoded = re.sub(r'\[CQ:reply,id=([^\]]+)\]', _reply, decoded)
+    # 图片 / 表情包要在通用兜底之前处理，否则会被压成 [image] / [mface]
+    decoded = re.sub(r'\[CQ:(image|mface)(?:,([^\]]*))?\]', _media, decoded)
     decoded = re.sub(r'\[CQ:forward,id=([^\]]+)\]', r'[合并转发: \1]', decoded)
     # 其余 [CQ:xxx,...] 一律换占位，别把原始 CQ 码丢给模型
     decoded = re.sub(r'\[CQ:([A-Za-z_]+)(?:,[^\]]*)?\]', _generic, decoded)
-    return decoded.strip()
+    return html.unescape(decoded).strip()
 
 
 def clean_message_history(raw_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -633,18 +745,38 @@ def clean_message_history(raw_messages: list[dict[str, Any]]) -> list[dict[str, 
     clean_msgs = []
     # message_id -> (发送者昵称, 已清洗正文)，用于把引用回复还原成 [回复 谁: 说了什么]
     reply_index: dict[str, tuple[str, str]] = {}
-    for m in raw_messages:
+    # 媒体身份键 -> (类别, 首次出现的消息编号)，用于把同一张图的重复出现标成 同#N
+    seen_media: dict[str, tuple[str, int]] = {}
+    for ordinal, m in enumerate(raw_messages, 1):
         forward_id = None
         text_segments = []
         msg_list = m.get("message", [])
+        # QQ 发商城表情时会额外补一段文字 "[表情名]" 作为兜底显示，和段数组里的
+        # 表情重复；这里用它来吃掉紧跟在后面的那段同名字面量。
+        pending_dup = ""
         if isinstance(msg_list, list):
             for seg in msg_list:
                 stype = seg.get("type")
                 sdata = seg.get("data", {})
                 if stype == "text":
-                    text_segments.append(sdata.get("text", ""))
-                elif stype == "image":
-                    text_segments.append("[图片]")
+                    text_value = str(sdata.get("text", ""))
+                    if pending_dup and text_value.strip() == pending_dup:
+                        pending_dup = ""
+                        continue
+                    pending_dup = ""
+                    text_segments.append(text_value)
+                elif stype in ("image", "mface"):
+                    kind, label = classify_media(stype, sdata)
+                    name = _media_name(sdata.get("summary"))
+                    pending_dup = f"[{name}]" if (kind == "mface" and name) else ""
+                    identity = media_identity(sdata)
+                    if identity:
+                        first = seen_media.get(identity)
+                        if first is not None:
+                            label = _append_media_ref(label, first[1])
+                        else:
+                            seen_media[identity] = (kind, ordinal)
+                    text_segments.append(label)
                 elif stype == "forward":
                     fid = sdata.get("id")
                     forward_id = fid
@@ -662,9 +794,11 @@ def clean_message_history(raw_messages: list[dict[str, Any]]) -> list[dict[str, 
                     quoted = sdata.get("text")
                     if target:
                         text_segments.append(f"[回复 {target[0]}: {_reply_snippet(target[1])}]")
-                    elif quoted:
-                        text_segments.append(f"[回复 {_reply_snippet(quoted)}]")
+                    elif quoted and not _looks_binary(quoted):
+                        snip = _reply_snippet(quoted)
+                        text_segments.append(f"[回复 {snip}]" if snip else "[回复]")
                     else:
+                        # 被引用的消息不在本次窗口里，且 text 是二进制块：只能标个 [回复]
                         text_segments.append("[回复]")
                 elif stype == "at":
                     qq = sdata.get("qq", "")
@@ -840,6 +974,7 @@ def build_snowluma_mcp() -> FastMCP:
         instructions=(
             "SnowLuma QQ 机器人控制网关。支持收发群聊与私聊消息（支持@群友和引用回复）、查看群聊与私聊历史、智能解析合并转发聊天记录、"
             "贴表情反应（Reaction）、管理群成员，以及通过 call_onebot_action 透传调用底层 170+ 个 OneBot v11 原生动作。"
+            "历史记录里的媒体以占位呈现：[图片] 普通图片、[动画表情] 动图表情、[表情包:名字] 商城表情。"
         ),
         streamable_http_path="/mcp",
         transport_security=security,
@@ -930,6 +1065,10 @@ def build_snowluma_mcp() -> FastMCP:
             - 'text' (默认): 返回两段纯文本块（不是 JSON，所以换行不会被转义成 \\n）：第一段是带序号的可读剧本（多行消息自动悬挂缩进），第二段是 {count, message_ids}，剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
             - 'compact': 结构化精简 JSON 数组，已剥离冗余协议字段、CDN 长链接与同值别名字段（不再输出 sender / content）
             - 'raw': 原始 OneBot 数据（仅供底层调试）
+
+        媒体占位（历史记录不回传图片内容）：[图片] 普通图片；[动画表情] 动图/自制动图表情；
+        [表情包:名字] QQ 商城表情（名字取自 QQ 侧，可能缺失）。同一张图在同一次结果里重复出现时，
+        第 2 次起标成 [.. 同#N]，N 是它第一次出现的那条消息编号。
         """
         params: dict[str, Any] = {"group_id": int(group_id), "count": min(max(int(count), 1), 100)}
         if message_seq is not None:
@@ -975,6 +1114,10 @@ def build_snowluma_mcp() -> FastMCP:
             - 'text' (默认): 返回两段纯文本块（不是 JSON，所以换行不会被转义成 \\n）：第一段是带序号的可读剧本（多行消息自动悬挂缩进），第二段是 {count, message_ids}，剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
             - 'compact': 结构化精简 JSON 数组，已剥离冗余协议字段、CDN 长链接与同值别名字段（不再输出 sender / content）
             - 'raw': 原始 OneBot 数据（仅供底层调试）
+
+        媒体占位（历史记录不回传图片内容）：[图片] 普通图片；[动画表情] 动图/自制动图表情；
+        [表情包:名字] QQ 商城表情（名字取自 QQ 侧，可能缺失）。同一张图在同一次结果里重复出现时，
+        第 2 次起标成 [.. 同#N]，N 是它第一次出现的那条消息编号。
         """
         params: dict[str, Any] = {"user_id": int(user_id), "count": min(max(int(count), 1), 100)}
         if message_seq is not None:
@@ -1016,6 +1159,10 @@ def build_snowluma_mcp() -> FastMCP:
             - 'text' (默认): 返回两段纯文本块（不是 JSON，所以换行不会被转义成 \\n）：第一段是带序号的可读剧本（多行消息自动悬挂缩进），第二段是 {count, message_ids}，剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
             - 'compact': 结构化精简 JSON 数组，已剥离冗余字段、CDN 长链接与同值别名字段（不再输出 sender / content）
             - 'raw': 原始 OneBot 数据（仅供底层调试）
+
+        媒体占位（历史记录不回传图片内容）：[图片] 普通图片；[动画表情] 动图/自制动图表情；
+        [表情包:名字] QQ 商城表情（名字取自 QQ 侧，可能缺失）。同一张图在同一次结果里重复出现时，
+        第 2 次起标成 [.. 同#N]，N 是它第一次出现的那条消息编号。
         """
         clean_id = str(forward_id).strip()
         if clean_id.startswith("[CQ:forward,id=") and clean_id.endswith("]"):
