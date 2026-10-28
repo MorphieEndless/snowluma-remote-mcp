@@ -37,7 +37,7 @@
 **SnowLuma Remote MCP** 采用原生 **Python + FastMCP** 架构重构，彻底移除了子进程管道层：
 - 🚀 **原生远程架构**：纯异步 ASGI 网络服务，无子进程拉起，杜绝管道僵死与进程泄露。
 - 🪶 **极致轻量高效**：基于 Python 3.12 + 官方 MCP SDK 构建，常驻内存仅约 **15 MB**。
-- 💬 **为 AI Agent 量身定制**：精心封装了发送消息、拉取精简历史、@群友、引用回复、合并转发智能解析与群管理等 20 个扁平化高频工具。
+- 💬 **为 AI Agent 量身定制**：精心封装了发送消息、拉取精简历史、@群友、引用回复、合并转发智能解析、能分清图片与表情的媒体占位、按需看图与群管理等 21 个扁平化高频工具。
 - ✨ **独家全量 280+ 贴表情反应（Reaction）**：内置 345+ 常见中文别名与网络热梗（如 `尊嘟假嘟`、`给你一拳`、`菜狗`、`狗头`、`摸鱼`、`打call` 等），直通 Linux NTQQ 官方 Reaction 库，支持整数 ID 自由透传。
 - 🛡️ **生产级安全防护**：内置 Bearer Token 强校验中间件、反向代理穿透与防 DNS 重绑定白名单放行。
 - ⚡ **全能 OneBot 透传**：提供 `call_onebot_action` 万能接口，直接透传调用底层 170+ 个 OneBot v11 原生动作。
@@ -49,13 +49,13 @@
 ```mermaid
 flowchart TD
     Client["📱 移动端客户端 (Android RikkaHub)"] -->|"HTTPS POST + Bearer Token<br/>(Streamable HTTP: /mcp)"| Nginx["🌐 Nginx (反向代理网关)"]
-    Nginx -->|"HTTP (127.0.0.1:8766)"| MCP["⚡ SnowLuma Remote MCP 服务端 (FastMCP ASGI)<br/>• BearerAuthMiddleware 鉴权中间件<br/>• 20 个 Agent 原生工具<br/>• 280+ 全量系统表情与 345+ 别名映射库"]
+    Nginx -->|"HTTP (127.0.0.1:8766)"| MCP["⚡ SnowLuma Remote MCP 服务端 (FastMCP ASGI)<br/>• BearerAuthMiddleware 鉴权中间件<br/>• 21 个 Agent 原生工具<br/>• 280+ 全量系统表情与 345+ 别名映射库"]
     MCP -->|"HTTP POST (127.0.0.1:3000)"| SnowLuma["🐧 SnowLuma 运行时 (Linux NTQQ + OneBot v11)"]
 ```
 
 ---
 
-## 🛠️ 工具矩阵（20 个原生工具）
+## 🛠️ 工具矩阵（21 个原生工具）
 
 ### 1. 消息收发与轻量互动
 | 工具名称 | 功能说明 | 参数与核心亮点 |
@@ -66,8 +66,9 @@ flowchart TD
 | `delete_msg` | 撤回消息 | 支持撤回机器人自己发送或具备管理权限的消息 |
 | `get_msg` | 获取单条消息详情 | 根据消息 ID 解析发送者与消息原文 |
 | `get_group_msg_history` | 获取群历史记录 | 自动剔除冗余字段，智能提取合并转发 ID，大幅缩减 LLM 上下文 Token 开销 |
-| `get_friend_msg_history` | 获取私聊历史记录 | 自动剔除冗余协议字段，智能提取合并转发 ID，支持向前翻页查询 |
+| `get_friend_msg_history` | 获取私聊历史记录 | 自动剔除冗余协议字段，智能提取合并转发 ID |
 | `get_forward_msg` | 智能解析合并转发 | 将底层几十 KB 臃肿的 OneBot AST 清洗转换为高信噪比 Markdown 剧本（Token 缩减 95%），模型开箱即读 |
+| `view_image` | 查看消息里的图片 | 按需调用：返回一张降采样后的 JPEG/PNG（动图只取首帧）以及一段 JSON 元数据；转发包里的消息需带上 `forward_id` |
 | `set_msg_emoji_like` | 贴表情反应 (Reaction) | 支持 345+ 中文名/热梗（如 `点赞`, `狗头`, `菜狗`, `尊嘟假嘟`）及 280+ 官方数字 ID |
 | `list_supported_emojis` | 列出可用反应表情 | 返回分类推荐表情列表与完整的 345+ 映射字典 |
 
@@ -88,6 +89,8 @@ flowchart TD
 | 工具名称 | 功能说明 | 参数与核心亮点 |
 |---|---|---|
 | `call_onebot_action` | OneBot 原生动作透传 | 支持直接透传调用底层 170+ 个 OneBot v11 原生动作 |
+
+> **关于 `view_image`**：它不会被自动调用，而且天然昂贵——图片一旦进了客户端会话，之后每一轮请求都会重传。历史里的占位（`[图片]` 普通图片、`[动画表情]` 动图表情、`[表情包:名字]` QQ 商城表情、`同#N` 表示同一文件的重复出现）本身就是“要不要看”的判断依据，只在像素真的影响结论时才调。动图只回第一帧；超出 QQ 媒体保留期的图会返回 `file has expired` 且不可恢复。依赖 Pillow（已列入 `requirements.txt`）。
 
 ---
 
@@ -119,6 +122,13 @@ MCP_AUTH_TOKEN=在此设置你的安全随机鉴权密钥
 SNOWLUMA_API_BASE=http://127.0.0.1:3000
 SNOWLUMA_API_TOKEN=在此填写你的SnowLuma_OneBot_HTTP_Token
 SNOWLUMA_TIMEOUT=30.0
+
+# 可选 —— view_image 调参（下列为默认值）
+# VIEW_IMAGE_ENABLED=1
+# VIEW_IMAGE_MAX_EDGE=1024
+# VIEW_IMAGE_TARGET_BYTES=204800
+# VIEW_IMAGE_MAX_SOURCE_BYTES=20971520
+# VIEW_IMAGE_CACHE_BYTES=67108864
 ```
 
 ### 3. 运行测试
@@ -183,7 +193,7 @@ location /mcp-health {
    - **名称**：`SnowLuma`
    - **URL**：`https://你的公网域名.com/mcp`
    - **Authorization**：`Bearer <你的_MCP_AUTH_TOKEN>`
-4. 保存后，进入 Agent 聊天界面，即可在工具托盘中看到 20 个全新工具！
+4. 保存后，进入 Agent 聊天界面，即可在工具托盘中看到 21 个全新工具！RikkaHub 会把工具结果里的图片直接交给模型；遇到纯文本模型时会自动回落为 OCR 文本。
 
 ---
 
