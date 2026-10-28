@@ -38,7 +38,7 @@ Instead of wrapping bloated subprocess gateways like `supergateway` (which suffe
 ### Key Highlights
 - 🚀 **Native Remote Architecture**: Pure asynchronous ASGI service, zero subprocess wrappers, zero pipe stalls.
 - 🪶 **Extremely Lightweight**: Built on Python 3.12 + official `mcp` SDK; resident memory is only **~15 MB** (vs 100MB+ for Node.js suites).
-- 💬 **Tailored for AI Agents**: Flat, intuitive tooling for messaging, chat history retrieval, smart forward message unpacking, group management, and quotation replies (20 tools).
+- 💬 **Tailored for AI Agents**: Flat, intuitive tooling for messaging, chat history retrieval, smart forward message unpacking, media placeholders that tell images from stickers, on-demand image viewing, group management, and quotation replies (21 tools).
 - ✨ **Full 280+ QQ System Reaction Support**: Built-in 345+ popular Chinese aliases & network memes directly mapped to Linux NTQQ official Reaction IDs, plus full integer ID passthrough.
 - 🛡️ **Hardened Production Security**: Bearer Token authentication, DNS-rebinding protection bypass for reverse proxies, and single-port HTTPS multiplexing.
 - ⚡ **Universal OneBot Pass-through**: Includes `call_onebot_action` to access all 170+ native OneBot v11 actions without writing extra code.
@@ -50,13 +50,13 @@ Instead of wrapping bloated subprocess gateways like `supergateway` (which suffe
 ```mermaid
 flowchart TD
     Client["📱 Mobile Client (Android RikkaHub)"] -->|"HTTPS POST + Bearer Token<br/>(Streamable HTTP: /mcp)"| Nginx["🌐 Nginx (Reverse Proxy)"]
-    Nginx -->|"HTTP (127.0.0.1:8766)"| MCP["⚡ SnowLuma Remote MCP Server (FastMCP ASGI)<br/>• BearerAuthMiddleware<br/>• 20 Standard Agent Tools<br/>• 280+ Official Reactions & 345+ Meme Map"]
+    Nginx -->|"HTTP (127.0.0.1:8766)"| MCP["⚡ SnowLuma Remote MCP Server (FastMCP ASGI)<br/>• BearerAuthMiddleware<br/>• 21 Standard Agent Tools<br/>• 280+ Official Reactions & 345+ Meme Map"]
     MCP -->|"HTTP POST (127.0.0.1:3000)"| SnowLuma["🐧 SnowLuma Runtime (Linux NTQQ + OneBot v11)"]
 ```
 
 ---
 
-## 🛠️ Tool Catalog (20 Tools)
+## 🛠️ Tool Catalog (21 Tools)
 
 ### 1. Messaging & Interaction
 | Tool | Description | Highlights |
@@ -69,6 +69,7 @@ flowchart TD
 | `get_group_msg_history` | Read recent group history | Strips redundant fields and extracts forward message IDs |
 | `get_friend_msg_history` | Read private chat history | Cleaned sender info and extracts forward message IDs |
 | `get_forward_msg` | Unpack forward message chain | Transforms bloated OneBot AST into high-signal Markdown dialogue (95% token savings) |
+| `view_image` | View the picture inside a message | Opt-in: returns one downscaled JPEG/PNG (first frame for GIFs), plus a JSON metadata block. Pass `forward_id` for messages inside a forward |
 | `set_msg_emoji_like` | Set message Reaction | Supports 345+ Chinese names (e.g. `点赞`, `狗头`, `菜狗`, `尊嘟假嘟`) & 280+ numeric IDs |
 | `list_supported_emojis` | List reaction emojis | Returns categorized lists and full dictionary with 345+ mappings |
 
@@ -89,6 +90,8 @@ flowchart TD
 | Tool | Description | Highlights |
 |---|---|---|
 | `call_onebot_action` | Universal OneBot pass-through | Direct access to all 170+ OneBot v11 actions |
+
+> **About `view_image`**: it is opt-in, never called automatically, and costly by nature — the picture lands in the client session and gets re-sent on every following turn. History placeholders already tell you *what* is there (`[图片]` image, `[动画表情]` animated sticker, `[表情包:name]` QQ market sticker) and `同#N` marks a repeat of the same file, so only call it when the actual pixels matter. GIFs return their first frame; images older than QQ's media retention window return `file has expired` and cannot be recovered. Requires Pillow (see `requirements.txt`).
 
 ---
 
@@ -120,6 +123,13 @@ MCP_AUTH_TOKEN=generate_a_secure_token_here
 SNOWLUMA_API_BASE=http://127.0.0.1:3000
 SNOWLUMA_API_TOKEN=your_snowluma_onebot_token_here
 SNOWLUMA_TIMEOUT=30.0
+
+# Optional — view_image tuning (defaults shown)
+# VIEW_IMAGE_ENABLED=1
+# VIEW_IMAGE_MAX_EDGE=1024
+# VIEW_IMAGE_TARGET_BYTES=204800
+# VIEW_IMAGE_MAX_SOURCE_BYTES=20971520
+# VIEW_IMAGE_CACHE_BYTES=67108864
 ```
 
 ### 3. Run
@@ -184,7 +194,7 @@ In [RikkaHub](https://github.com/rikkahub/rikkahub):
    - **Name**: `SnowLuma`
    - **URL**: `https://your-domain.com/mcp`
    - **Authorization**: `Bearer <your_MCP_AUTH_TOKEN>`
-4. Save and verify that your tools appear in your Agent's tool palette!
+4. Save and verify that your tools appear in your Agent's tool palette (21 tools)! RikkaHub forwards tool-result images straight to the model, and falls back to OCR for text-only models.
 
 ---
 
