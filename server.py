@@ -14,12 +14,13 @@ import logging
 import os
 import re
 import html
+import io
 import sys
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import TextContent
 from starlette.applications import Starlette
@@ -674,6 +675,281 @@ def _append_media_ref(label: str, ref: int) -> str:
     return f"{label} 同#{ref}"
 
 
+# ---------------- 按需取图（view_image 扩展能力） ----------------
+#
+# 为什么不在 get_*_history 里直接回图：一份 100 条的历史里图片平均 482 KB，动图表情
+# 实测有 0.7~11 MB 的，全量 base64 之后能到几十 MB；而且工具结果里的图片会留在客户端
+# 会话里，之后每一轮请求都要重传一遍。所以图片只在调用方点名要看某条消息时才取。
+#
+# 取图链路：message_id → get_msg 拿到段里的 file/url → 必要时 get_image 重新签名
+# → 下载原始字节 → Pillow 抽首帧 + 缩放 + 重编码 → 回 ImageContent。
+#
+# 两种"过期"要分开：
+#   - rkey 是下载 URL 里的签名，过期了用 get_image 拿一条新的就行（实测有效）；
+#   - 文件本身在 QQ 侧有保留期，实测 9 天内的图还能下，68 天的返回
+#     {"retcode":-5503042,"retmsg":"file has expired"}，重新签名也救不回来。
+#
+# 默认值都可以用环境变量覆盖；VIEW_IMAGE_ENABLED=0 可以不注册这个工具。
+
+VIEW_IMAGE_ENABLED = os.getenv("VIEW_IMAGE_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+VIEW_IMAGE_MAX_EDGE = max(256, int(os.getenv("VIEW_IMAGE_MAX_EDGE", "1024")))
+VIEW_IMAGE_TARGET_BYTES = max(32 * 1024, int(os.getenv("VIEW_IMAGE_TARGET_BYTES", str(200 * 1024))))
+VIEW_IMAGE_MAX_SOURCE_BYTES = max(1 << 20, int(os.getenv("VIEW_IMAGE_MAX_SOURCE_BYTES", str(20 << 20))))
+VIEW_IMAGE_TIMEOUT = float(os.getenv("VIEW_IMAGE_TIMEOUT", "20.0"))
+VIEW_IMAGE_CACHE_BYTES = max(0, int(os.getenv("VIEW_IMAGE_CACHE_BYTES", str(64 << 20))))
+VIEW_IMAGE_CACHE_DIR = os.getenv("VIEW_IMAGE_CACHE_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "cache", "images"
+)
+# 只允许从 QQ 自家的 CDN 下媒体，免得 message 段里的 url 被换成一个任意地址
+VIEW_IMAGE_ALLOWED_HOSTS = tuple(
+    item.strip().lower()
+    for item in os.getenv("VIEW_IMAGE_ALLOWED_HOSTS", "qq.com,qq.com.cn").split(",")
+    if item.strip()
+)
+
+
+class ImageUnavailable(Exception):
+    """取图失败。message 会原样交给调用方，所以要写成人能看懂的话。"""
+
+
+def collect_media_segments(message: Any) -> list[dict[str, Any]]:
+    """从一个 OneBot message（段数组或 CQ 字符串）里挑出所有 image/mface 段。
+
+    段数组和 CQ 字符串两种形态都要兜：前者是 SnowLuma 的实际输出，后者是别的
+    OneBot 实现的配置。
+    """
+    media: list[dict[str, Any]] = []
+    if isinstance(message, list):
+        for seg in message:
+            if not isinstance(seg, dict):
+                continue
+            seg_type = str(seg.get("type") or "").lower()
+            if seg_type in ("image", "mface"):
+                data = seg.get("data")
+                media.append({"type": seg_type, **(data if isinstance(data, dict) else {})})
+    elif isinstance(message, str):
+        for match in re.finditer(r"\[CQ:(image|mface)(?:,([^\]]*))?\]", message):
+            media.append({"type": match.group(1).lower(), **_parse_cq_params(match.group(2) or "")})
+    return media
+
+
+def _is_allowed_media_url(url: str) -> bool:
+    try:
+        parsed = httpx.URL(url)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.host or "").lower()
+    return any(host == suffix or host.endswith("." + suffix) for suffix in VIEW_IMAGE_ALLOWED_HOSTS)
+
+
+async def _download_media(url: str) -> bytes:
+    """下载一张媒体原图，带体积上限（动图表情能到 11 MB，不能无脑读完）。"""
+    if not _is_allowed_media_url(url):
+        raise ImageUnavailable(f"媒体 URL 不在允许的域名范围内：{url[:80]}")
+    client = await get_http_client()
+    total = 0
+    chunks: list[bytes] = []
+    try:
+        async with client.stream("GET", url, timeout=VIEW_IMAGE_TIMEOUT) as resp:
+            if resp.status_code >= 400:
+                body = (await resp.aread())[:200].decode("utf-8", "replace").strip()
+                if "-5503042" in body or "file has expired" in body:
+                    # QQ 侧文件保留期到了：换签名也没用，别再让调用方抱着期望重试
+                    raise ImageUnavailable(
+                        "QQ 侧的媒体文件已过期（file has expired），重新签名也取不回来；"
+                        "这条图只能靠历史里的占位文字判断"
+                    )
+                raise ImageUnavailable(f"HTTP {resp.status_code} {body}".strip())
+            async for chunk in resp.aiter_bytes():
+                total += len(chunk)
+                if total > VIEW_IMAGE_MAX_SOURCE_BYTES:
+                    raise ImageUnavailable(
+                        f"原图超过 {VIEW_IMAGE_MAX_SOURCE_BYTES // 1024 // 1024} MB 上限，已放弃下载"
+                    )
+                chunks.append(chunk)
+    except httpx.HTTPError as exc:
+        raise ImageUnavailable(f"下载失败：{type(exc).__name__} ({exc})") from exc
+    if not chunks:
+        raise ImageUnavailable("下载到 0 字节")
+    return b"".join(chunks)
+
+
+async def fetch_media_bytes(seg: dict[str, Any]) -> tuple[bytes, str]:
+    """返回 (原始字节, 来源说明)。先试段里带的 url，不行再用 file 重新签名。"""
+    file_id = str(seg.get("file") or "").strip()
+    url = str(seg.get("url") or "").strip()
+    notes: list[str] = []
+    if url:
+        try:
+            return await _download_media(url), "原链接"
+        except ImageUnavailable as exc:
+            notes.append(f"原链接 {exc}")
+    if file_id:
+        resigned = await call_snowluma("get_image", {"file": file_id})
+        if resigned.get("ok"):
+            data = resigned.get("data") or {}
+            fresh = str(data.get("url") or data.get("file") or "").strip()
+            if fresh and fresh != url:
+                try:
+                    return await _download_media(fresh), "重新签名"
+                except ImageUnavailable as exc:
+                    notes.append(f"重新签名后 {exc}")
+        else:
+            notes.append(f"get_image 失败：{resigned.get('error')}")
+    raise ImageUnavailable("；".join(notes) or "这条消息里没有可下载的图片地址")
+
+
+def shrink_image(raw: bytes, max_edge: int) -> tuple[bytes, str, int, int, int, bool]:
+    """抽首帧 → 摆正方向 → 缩到长边 max_edge → 编码。
+
+    返回 (字节, 容器格式 png/jpeg, 宽, 高, 原图帧数, 是否丢了后续帧)。
+    - 动图只取第一帧：后面几十帧对"看懂这张表情"没有增量，却会把体积翻几倍。
+    - 原图是 PNG（常见于截图）时先尝试保持 PNG，压不到目标体积再退 JPEG，
+      免得截图里的文字被 JPEG 糊掉。
+    """
+    try:
+        from PIL import Image as PILImage
+        from PIL import ImageOps
+    except ImportError as exc:  # 部署时漏装 Pillow 才会走到这里
+        raise ImageUnavailable("服务端没装 Pillow，无法处理图片（pip install pillow）") from exc
+
+    try:
+        with PILImage.open(io.BytesIO(raw)) as probe:
+            frames = int(getattr(probe, "n_frames", 1) or 1)
+            source_format = str(probe.format or "").upper()
+            width, height = probe.size
+            orientation = 1
+            if source_format == "JPEG":
+                try:
+                    orientation = int(probe.getexif().get(0x0112, 1) or 1)
+                except Exception:
+                    orientation = 1
+    except Exception as exc:
+        raise ImageUnavailable(f"不是能解码的图片：{type(exc).__name__}") from exc
+
+    # 已经合格的静态图直接原样返回：重新编码只会让体积变大或质量变差
+    if (
+        source_format in ("PNG", "JPEG", "WEBP", "GIF")
+        and frames == 1
+        and orientation == 1
+        and max(width, height) <= max_edge
+        and len(raw) <= VIEW_IMAGE_TARGET_BYTES
+    ):
+        return raw, source_format.lower(), width, height, frames, False
+
+    with PILImage.open(io.BytesIO(raw)) as source:
+        source.seek(0)
+        image = ImageOps.exif_transpose(source)
+        if image.mode in ("RGBA", "LA", "P"):
+            # 透明底压成白底，否则 JPEG 会把透明区域变成黑块
+            flattened = PILImage.new("RGB", image.size, (255, 255, 255))
+            rgba = image.convert("RGBA")
+            flattened.paste(rgba, mask=rgba.split()[-1])
+            image = flattened
+        elif image.mode != "RGB":
+            image = image.convert("RGB")
+        image.thumbnail((max_edge, max_edge), PILImage.LANCZOS)
+
+        png_buffer = io.BytesIO()
+        image.save(png_buffer, "PNG", optimize=True)
+        png_bytes = png_buffer.getvalue()
+
+        jpeg_bytes = b""
+        for quality in (85, 75, 65, 55, 45):
+            candidate = io.BytesIO()
+            image.save(candidate, "JPEG", quality=quality, optimize=True, progressive=True)
+            jpeg_bytes = candidate.getvalue()
+            if len(jpeg_bytes) <= VIEW_IMAGE_TARGET_BYTES:
+                break
+
+        # 源图是 PNG（多半是截图）时优先保 PNG：JPEG 会把小字糊掉，而这正是调这个工具
+        # 的常见理由。其余情况（照片、WebP）就挑体积小的那个。
+        fits = []
+        if len(png_bytes) <= VIEW_IMAGE_TARGET_BYTES:
+            fits.append((png_bytes, "png"))
+        if len(jpeg_bytes) <= VIEW_IMAGE_TARGET_BYTES:
+            fits.append((jpeg_bytes, "jpeg"))
+        if source_format == "PNG":
+            ordered = [c for c in fits if c[1] == "png"] + [c for c in fits if c[1] != "png"]
+        else:
+            ordered = sorted(fits, key=lambda item: len(item[0]))
+        # 都不达标时宁可略超目标体积，也别让调用方拿不到图
+        chosen = ordered[0] if ordered else (jpeg_bytes, "jpeg")
+        return chosen[0], chosen[1], image.width, image.height, frames, frames > 1
+
+
+def _cache_paths(key: str) -> tuple[str, str]:
+    return (
+        os.path.join(VIEW_IMAGE_CACHE_DIR, f"{key}.bin"),
+        os.path.join(VIEW_IMAGE_CACHE_DIR, f"{key}.json"),
+    )
+
+
+def cache_read(key: str) -> tuple[bytes, dict[str, Any]] | None:
+    payload_path, meta_path = _cache_paths(key)
+    try:
+        with open(payload_path, "rb") as handle:
+            payload = handle.read()
+        with open(meta_path, "r", encoding="utf-8") as handle:
+            meta = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not payload or not isinstance(meta, dict):
+        return None
+    try:
+        os.utime(payload_path, None)  # 触碰一下，LRU 按 mtime 淘汰
+    except OSError:
+        pass
+    return payload, meta
+
+
+def cache_write(key: str, payload: bytes, meta: dict[str, Any]) -> None:
+    if VIEW_IMAGE_CACHE_BYTES <= 0:
+        return
+    payload_path, meta_path = _cache_paths(key)
+    try:
+        os.makedirs(VIEW_IMAGE_CACHE_DIR, exist_ok=True)
+        with open(payload_path, "wb") as handle:
+            handle.write(payload)
+        with open(meta_path, "w", encoding="utf-8") as handle:
+            json.dump(meta, handle, ensure_ascii=False)
+    except OSError as exc:
+        logger.warning("写图片缓存失败 %s: %s", key, exc)
+        return
+    prune_cache()
+
+
+def prune_cache() -> None:
+    """按总字节数清理最旧的缓存条目。"""
+    if VIEW_IMAGE_CACHE_BYTES <= 0:
+        return
+    try:
+        entries = []
+        total = 0
+        for name in os.listdir(VIEW_IMAGE_CACHE_DIR):
+            path = os.path.join(VIEW_IMAGE_CACHE_DIR, name)
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            entries.append((stat.st_mtime, stat.st_size, path))
+            total += stat.st_size
+        if total <= VIEW_IMAGE_CACHE_BYTES:
+            return
+        entries.sort()
+        for _, size, path in entries:
+            if total <= VIEW_IMAGE_CACHE_BYTES:
+                break
+            os.unlink(path)
+            total -= size
+    except OSError as exc:
+        logger.warning("清理图片缓存失败: %s", exc)
+
+
 # CQ 码段类型 / 段数组的 type → 可读占位。主路径（段数组）和兜底路径（CQ 字符串）
 # 共用同一张表，免得同一条消息在两种格式下读起来不一样。
 # image / mface 走 classify_media()，这里只留作最终兜底。
@@ -1048,6 +1324,149 @@ def build_snowluma_mcp() -> FastMCP:
         """根据消息 ID 获取单条消息的具体内容与发送者详情。"""
         return await call_snowluma("get_msg", {"message_id": int(message_id)})
 
+    if VIEW_IMAGE_ENABLED:
+
+        @mcp.tool()
+        async def view_image(
+            message_id: int,
+            forward_id: str | None = None,
+            index: int = 0,
+            max_edge: int = 0,
+        ) -> Any:
+            """把某条消息里附带的图片/表情包的画面取回来，作为一张压缩后的图片返回。
+
+            什么时候该用：历史记录里出现 [图片]、[动画表情]、[表情包:名字]，而你必须看清
+            画面才能继续（截图里的报错、画的图、表情到底什么梗、图里写了什么字）。
+            什么时候不用：只是知道"发了张图/发了个表情"就够——那看历史里的占位即可，别调。
+
+            参数:
+            - message_id: 消息 ID（历史/转发工具第二段返回的 message_ids 里取）
+            - forward_id: 当这条消息是从合并转发里读出来的时候必填——转发包里的 message_id
+              不是普通消息 ID，get_msg 查不到，必须靠它去转发包里定位
+            - index: 一条消息里有多张图时用，0 表示第一张（默认）
+            - max_edge: 压缩后长边像素上限，0 表示用服务端默认值（1024）；范围 256~2048
+
+            返回：两段内容。[0] 是一行 JSON 元数据（ok/kind/size/是否动图抽帧等），
+            [1] 是图片本体（JPEG 或 PNG）。客户端若支持图片输入，模型能直接看到画面；
+            纯文本模型拿到的只是元数据，别指望它能"看"。
+
+            限制：动图表情只取第一帧；超过体积上限的原图会被拒绝；QQ 侧的媒体文件有保留期，
+            太老的图会返回 file has expired，重新签名也救不回来。合并转发里被 QQ 压成
+            纯文本的媒体（例如只剩一个 "[偷看]" 字面量）没有图可取。
+            """
+            scope = "direct"
+            if forward_id:
+                # 转发包里的 message_id 是另一个 ID 空间，get_msg 一律 message not found；
+                # 好在转发包本身就把 url/file 带回来了，不用二次查询。
+                forwarded = await call_snowluma("get_forward_msg", {"id": forward_id})
+                if not forwarded.get("ok"):
+                    return [TextContent(type="text", text=json.dumps({
+                        "ok": False,
+                        "error": f"get_forward_msg 失败：{forwarded.get('error')}",
+                    }, ensure_ascii=False))]
+                payload = forwarded.get("data") or {}
+                messages = payload.get("messages") if isinstance(payload, dict) else payload
+                if not isinstance(messages, list):
+                    messages = []
+                target = next(
+                    (item for item in messages
+                     if isinstance(item, dict) and str(item.get("message_id")) == str(message_id)),
+                    None,
+                )
+                if target is None:
+                    return [TextContent(type="text", text=json.dumps({
+                        "ok": False,
+                        "message_id": message_id,
+                        "forward_id": forward_id,
+                        "error": f"这份合并转发（共 {len(messages)} 条）里找不到这个 message_id",
+                    }, ensure_ascii=False))]
+                data = target
+                scope = "forward"
+            else:
+                detail = await call_snowluma("get_msg", {"message_id": int(message_id)})
+                if not detail.get("ok"):
+                    err = str(detail.get("error") or "")
+                    hint = ("；如果这条消息是从合并转发里读到的，请带上 forward_id 再调用"
+                            if "not found" in err.lower() else "")
+                    return [TextContent(type="text", text=json.dumps({
+                        "ok": False,
+                        "error": f"get_msg 失败：{err}{hint}",
+                    }, ensure_ascii=False))]
+                data = detail.get("data") or {}
+            media = collect_media_segments(data.get("message"))
+            if not media:
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": False,
+                    "message_id": message_id,
+                    "error": "这条消息里没有图片或表情包段（可能是纯文字/语音/视频）",
+                }, ensure_ascii=False))]
+            if index < 0 or index >= len(media):
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": False,
+                    "message_id": message_id,
+                    "error": f"index 越界：这条消息共 {len(media)} 张媒体，index 从 0 开始",
+                }, ensure_ascii=False))]
+
+            seg = media[index]
+            kind, label = classify_media(seg.get("type"), seg)
+            identity = media_identity(seg)
+            edge = max(256, min(int(max_edge) or VIEW_IMAGE_MAX_EDGE, 2048))
+            cache_key = f"v{identity}_{edge}_{VIEW_IMAGE_TARGET_BYTES}" if identity else ""
+
+            meta: dict[str, Any] = {
+                "ok": True,
+                "message_id": message_id,
+                "kind": kind,              # image / sticker / mface
+                "placeholder": label,      # 与历史里看到的占位一致
+                "media_in_message": len(media),
+                "index": index,
+                "scope": scope,
+                "file_id": identity or None,
+            }
+
+            cached = cache_read(cache_key) if cache_key else None
+            if cached is not None:
+                payload, cached_meta = cached
+                meta.update(cached_meta)
+                meta["source"] = "缓存"
+                return [
+                    TextContent(type="text", text=json.dumps(meta, ensure_ascii=False)),
+                    Image(data=payload, format=meta.get("format") or "jpeg"),
+                ]
+
+            try:
+                raw, source = await fetch_media_bytes(seg)
+                payload, image_format, width, height, frames, truncated = shrink_image(raw, edge)
+            except ImageUnavailable as exc:
+                return [TextContent(type="text", text=json.dumps({
+                    **meta, "ok": False, "error": str(exc),
+                }, ensure_ascii=False))]
+
+            meta.update({
+                "source": source,
+                "format": image_format,
+                "width": width,
+                "height": height,
+                "bytes": len(payload),
+                "original_bytes": len(raw),
+                "frames": frames,
+                "first_frame_only": truncated,
+            })
+            if cache_key:
+                cache_write(cache_key, payload, {
+                    "format": image_format,
+                    "width": width,
+                    "height": height,
+                    "bytes": len(payload),
+                    "original_bytes": len(raw),
+                    "frames": frames,
+                    "first_frame_only": truncated,
+                })
+            return [
+                TextContent(type="text", text=json.dumps(meta, ensure_ascii=False)),
+                Image(data=payload, format=image_format),
+            ]
+
     @mcp.tool()
     async def get_group_msg_history(
         group_id: int,
@@ -1335,7 +1754,7 @@ def create_asgi_app() -> Starlette:
         login_res = await call_snowluma("get_login_info")
         return JSONResponse({
             "service": "snowluma-mcp",
-            "version": "1.2.5",
+            "version": "1.3.1",
             "status": "online",
             "snowluma_onebot": {
                 "alive": status_res.get("ok", False),
