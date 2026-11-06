@@ -1242,6 +1242,112 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+# ---------------- 合并转发 ID：归一化与失败语义 ----------------
+#
+# forward_id 从来不是干干净净地被抄回来的：CQ 码原文是 [CQ:forward,id=xxx]，本项目
+# text 剧本把它渲染成 [合并转发: xxx]，模型转述时还常带前后空格。get_forward_msg 早就
+# 吃掉 CQ 包装，view_image 却只认裸 ID —— 同一个包，一个工具通、一个报
+# "download forward message payload is empty"（issue #2，2026-11-02 实测）。
+# 归一化只保留这一份，两个工具共用，以后加第三个入口也不会再漏。
+#
+# 另一件事是失败语义：上游把「ID 抄错」「包被清理」「上游没缓存」全压成同一句
+# payload is empty，调用方无法判断该换 ID 还是该重试，只能反复无效尝试。这里把它翻译成
+# code + hint，让模型能自己决定下一步。
+
+_CQ_FORWARD_RE = re.compile(r"^\[CQ:forward,id=(.+)\]$", re.S)
+_TEXT_FORWARD_RES = (
+    re.compile(r"^\[合并转发:\s*(.+)\]$", re.S),
+    re.compile(r"^合并转发:\s*(.+)$", re.S),
+)
+
+# code -> (上游原文片段, 给调用方的 hint)
+_FORWARD_FAILURES: dict[str, tuple[str, str]] = {
+    "FORWARD_ID_EMPTY": (
+        "id or message_id is required",
+        "forward_id 是空的。先用 get_group_msg_history / get_friend_msg_history 取真实 ID，不要自己拼。",
+    ),
+    "FORWARD_NOT_FOUND": (
+        "download forward message payload is empty",
+        "这个 forward_id 取不到内容：ID 抄错、包已被 QQ 侧清理，或上游没有缓存这个包。"
+        "请用 get_*_msg_history 重新取一次真实 ID；同一个 ID 重试不会有别的结果。",
+    ),
+}
+
+_UPSTREAM_HINT = "上游异常，可原样重试一次；持续失败请查 SnowLuma 日志。"
+
+
+def normalize_forward_id(raw: Any) -> str:
+    """把各种形态收敛成裸 forward_id；取不到内容时返回空串。
+
+    认这几种：裸 ID、[CQ:forward,id=xxx]、[合并转发: xxx]（本项目的 text 剧本形态）、
+    以及上述任何一种带前后空白的版本。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    for pattern in (_CQ_FORWARD_RE, *_TEXT_FORWARD_RES):
+        match = pattern.match(text)
+        if match:
+            return match.group(1).strip()
+    return text
+
+
+def forward_failure(
+    code: str,
+    forward_id: str,
+    error: str = "",
+    retcode: Any = None,
+) -> dict[str, Any]:
+    """构造转发类失败的返回体：code 决定 hint，未知 code 落到 FORWARD_UPSTREAM_ERROR。"""
+    spec = _FORWARD_FAILURES.get(code)
+    if spec is None:
+        return {
+            "ok": False,
+            "code": "FORWARD_UPSTREAM_ERROR",
+            "forward_id": forward_id,
+            "error": str(error or ""),
+            "hint": _UPSTREAM_HINT,
+            "retcode": retcode,
+            "data": None,
+        }
+    needle, hint = spec
+    return {
+        "ok": False,
+        "code": code,
+        "forward_id": forward_id,
+        "error": str(error or needle),
+        "hint": hint,
+        "retcode": retcode,
+        "data": None,
+    }
+
+
+def explain_forward_failure(forward_id: str, res: dict[str, Any]) -> dict[str, Any]:
+    """按上游原话把失败归类，回显 forward_id 与 retcode。"""
+    raw = str(res.get("error") or "")
+    for code, (needle, _hint) in _FORWARD_FAILURES.items():
+        if needle in raw:
+            return forward_failure(code, forward_id, raw, res.get("retcode"))
+    return forward_failure("FORWARD_UPSTREAM_ERROR", forward_id, raw, res.get("retcode"))
+
+
+# 三个查询工具的 format 只有这三档；拼错（例如 compcat）原先会静默落进 text 分支，
+# 调用方以为拿到了 compact，实际是一份剧本。这里显式拒绝。
+FORMAT_CHOICES = ("text", "compact", "raw")
+
+
+def reject_bad_format(fmt: Any) -> dict[str, Any] | None:
+    """format 合法时返回 None，否则返回一个可决策的错误体。"""
+    if str(fmt) in FORMAT_CHOICES:
+        return None
+    return {
+        "ok": False,
+        "code": "BAD_FORMAT",
+        "error": f"format 必须是 {' / '.join(FORMAT_CHOICES)} 之一，收到 {fmt!r}",
+        "data": None,
+    }
+
+
 def build_snowluma_mcp() -> FastMCP:
     # 允许反向代理穿透与公网域名 Host
     security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
@@ -1342,7 +1448,8 @@ def build_snowluma_mcp() -> FastMCP:
             参数:
             - message_id: 消息 ID（历史/转发工具第二段返回的 message_ids 里取）
             - forward_id: 当这条消息是从合并转发里读出来的时候必填——转发包里的 message_id
-              不是普通消息 ID，get_msg 查不到，必须靠它去转发包里定位
+              不是普通消息 ID，get_msg 查不到，必须靠它去转发包里定位。
+              接受裸 ID、[CQ:forward,id=...]、[合并转发: ...] 三种写法，前后空白自动去掉
             - index: 一条消息里有多张图时用，0 表示第一张（默认）
             - max_edge: 压缩后长边像素上限，0 表示用服务端默认值（1024）；范围 256~2048
 
@@ -1355,15 +1462,14 @@ def build_snowluma_mcp() -> FastMCP:
             纯文本的媒体（例如只剩一个 "[偷看]" 字面量）没有图可取。
             """
             scope = "direct"
-            if forward_id:
+            fid = normalize_forward_id(forward_id)
+            if fid:
                 # 转发包里的 message_id 是另一个 ID 空间，get_msg 一律 message not found；
                 # 好在转发包本身就把 url/file 带回来了，不用二次查询。
-                forwarded = await call_snowluma("get_forward_msg", {"id": forward_id})
+                forwarded = await call_snowluma("get_forward_msg", {"id": fid})
                 if not forwarded.get("ok"):
-                    return [TextContent(type="text", text=json.dumps({
-                        "ok": False,
-                        "error": f"get_forward_msg 失败：{forwarded.get('error')}",
-                    }, ensure_ascii=False))]
+                    return [TextContent(type="text", text=json.dumps(
+                        explain_forward_failure(fid, forwarded), ensure_ascii=False))]
                 payload = forwarded.get("data") or {}
                 messages = payload.get("messages") if isinstance(payload, dict) else payload
                 if not isinstance(messages, list):
@@ -1376,8 +1482,9 @@ def build_snowluma_mcp() -> FastMCP:
                 if target is None:
                     return [TextContent(type="text", text=json.dumps({
                         "ok": False,
+                        "code": "FORWARD_MESSAGE_NOT_FOUND",
                         "message_id": message_id,
-                        "forward_id": forward_id,
+                        "forward_id": fid,
                         "error": f"这份合并转发（共 {len(messages)} 条）里找不到这个 message_id",
                     }, ensure_ascii=False))]
                 data = target
@@ -1489,6 +1596,10 @@ def build_snowluma_mcp() -> FastMCP:
         [表情包:名字] QQ 商城表情（名字取自 QQ 侧，可能缺失）。同一张图在同一次结果里重复出现时，
         第 2 次起标成 [.. 同#N]，N 是它第一次出现的那条消息编号。
         """
+        bad_format = reject_bad_format(format)
+        if bad_format:
+            return bad_format
+
         params: dict[str, Any] = {"group_id": int(group_id), "count": min(max(int(count), 1), 100)}
         if message_seq is not None:
             params["message_seq"] = int(message_seq)
@@ -1538,6 +1649,10 @@ def build_snowluma_mcp() -> FastMCP:
         [表情包:名字] QQ 商城表情（名字取自 QQ 侧，可能缺失）。同一张图在同一次结果里重复出现时，
         第 2 次起标成 [.. 同#N]，N 是它第一次出现的那条消息编号。
         """
+        bad_format = reject_bad_format(format)
+        if bad_format:
+            return bad_format
+
         params: dict[str, Any] = {"user_id": int(user_id), "count": min(max(int(count), 1), 100)}
         if message_seq is not None:
             params["message_seq"] = int(message_seq)
@@ -1573,7 +1688,9 @@ def build_snowluma_mcp() -> FastMCP:
         """获取并解析合并转发聊天记录（将臃肿的底层 OneBot 数据结构清洗转换为高信噪比对话内容）。
         
         参数:
-        - forward_id: 合并转发 ID（来自 CQ 码 [CQ:forward,id=...] 或 get_friend_msg_history 中的 forward_id 字段）
+        - forward_id: 合并转发 ID（来自 CQ 码 [CQ:forward,id=...] 或 get_friend_msg_history 中的 forward_id 字段）。
+          裸 ID、CQ 包装、[合并转发: ...] 三种写法都认，前后空白自动去掉；取不到时返回
+          code + hint（FORWARD_ID_EMPTY / FORWARD_NOT_FOUND / FORWARD_UPSTREAM_ERROR）
         - format: 输出格式，可选:
             - 'text' (默认): 返回两段纯文本块（不是 JSON，所以换行不会被转义成 \\n）：第一段是带序号的可读剧本（多行消息自动悬挂缩进），第二段是 {count, message_ids}，剧本第 N 条对应 message_ids[N-1]，供引用/撤回/贴表情时精确取用
             - 'compact': 结构化精简 JSON 数组，已剥离冗余字段、CDN 长链接与同值别名字段（不再输出 sender / content）
@@ -1583,13 +1700,17 @@ def build_snowluma_mcp() -> FastMCP:
         [表情包:名字] QQ 商城表情（名字取自 QQ 侧，可能缺失）。同一张图在同一次结果里重复出现时，
         第 2 次起标成 [.. 同#N]，N 是它第一次出现的那条消息编号。
         """
-        clean_id = str(forward_id).strip()
-        if clean_id.startswith("[CQ:forward,id=") and clean_id.endswith("]"):
-            clean_id = clean_id[len("[CQ:forward,id="):-1]
+        clean_id = normalize_forward_id(forward_id)
+        if not clean_id:
+            return forward_failure("FORWARD_ID_EMPTY", "")
+
+        bad_format = reject_bad_format(format)
+        if bad_format:
+            return bad_format
 
         res = await call_snowluma("get_forward_msg", {"id": clean_id})
         if not res.get("ok"):
-            return res
+            return explain_forward_failure(clean_id, res)
 
         if format == "raw":
             return res
@@ -1754,7 +1875,7 @@ def create_asgi_app() -> Starlette:
         login_res = await call_snowluma("get_login_info")
         return JSONResponse({
             "service": "snowluma-mcp",
-            "version": "1.3.1",
+            "version": "1.3.2",
             "status": "online",
             "snowluma_onebot": {
                 "alive": status_res.get("ok", False),
